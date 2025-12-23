@@ -1,76 +1,142 @@
-# Labeling Guide (v1.4)
-
-## 1. The Core Objective
-
-Analyze EMT memos to identify illicit drug activity. **Category A keywords** (Meth, Fentanyl, Coke, etc.) are treated as **High Risk (0.70+)** by default. A high-risk keyword + a street-standard price ($40, $80, $150) is a **Mandatory High Risk**.
-
-The **"Retail Alibi" (Decimals)** is no longer a blanket mitigation. It only applies if the amount is **Tax-Aligned**.
 
 ---
 
-## 2. The Updated Labeling Matrix
+# Labeling Guide (v3.3)
+
+## 1) Core Objective
+
+Label EMT memos for potential illicit drug activity using a **Severity-Based Baseline** plus **Forensic Verification**.
+**Forensic Default:** A transaction is categorized as low-risk only when a **Machine Signature** (tax-aligned math) and a **Context Anchor** (verifiable through web search or clinical terminology) are both present.
+
+### 1.1. The Updated Labeling Matrix
 
 | Score | Category | Typical Pattern / Logic |
 | --- | --- | --- |
 | **0.10** | **Safe / Institutional** | **THE ANCHOR RULE:** Verified business/institutional names (Rent, Shoppers, Rexall, UofT, Insurance). Overrides all keywords. |
-| **0.15** | **Safe Retail** | Drug keyword + **Tax-Aligned Cents** (Matches 5%, 11%, 12%, 13%, 14%, 14.975%, or 15%) **AND** a Category C Anchor. |
-| **0.35** | **Safe Joke** | Category B (Weed) + **Tax-Aligned Cents** OR repetitive decimals ($36.36). |
-| **0.75** | **Suspicious / Obfuscated** | Category A/B Keyword + **"Penny-Padding"** (Decimals present but *not* tax-aligned). This is treated as a cover-up for a round-number trade. |
+| **0.15** | **Definite Joke/Safe Retail** | Drug keyword + **Tax-Aligned Cents** + Multiple Anchors (Tax math + Verifiable Product)|
+| **0.35** | **Probable Joke** | drug keywrod + **Tax-Aligned Cents** + Contextual Absurdity OR Proper Noun Match |
+| **0.7** | **Leaning Joke, still suspicious** | Drug Keyword  + **Not Tax-Aligned Cents** + Interpersonal Conflict/Tone + fraction padding/obsfucation  + No quantity markers. |
+| **0.75** | **Suspicious / Obfuscated** | Category A/B Keyword  + No Context + Non-Street Integer (e.g., $33.00) + **"Penny-Padding"** (Decimals present but *not* tax-aligned). This is treated as a cover-up for a round-number trade. |
 | **0.85** | **High-Risk** | Category A/B + **Street Standard Price** ($40, $60, $80, $150, $200) OR Quantity Markers (e.g., "Meth 2"). |
 | **0.95+** | **Wholesale** | Bulk terms ("Brick", "Pack") + Round numbers >$400. |
 
 ---
 
-## 3. The "Tax-Alignment" Reference (Canada 2025)
+## 2) Severity-Based Starting Points (Baseline)
 
-To pass the "Retail Alibi" check, the `Total Amount` must be divisible by one of these multipliers (representing a round subtotal + tax):
+When a drug-related keyword (or slang mask) is present, start here:
 
-* **1.05** (GST only - AB, YT, NT, NU)
-* **1.11** (GST + SK PST)
-* **1.12** (GST + BC/MB PST)
-* **1.13** (HST - ON)
-* **1.14** (GST + PE PST)
-* **1.14975** (GST + QC QST)
-* **1.15** (HST - NS, NB, NL)
-
----
-
-## 4. The "High-Risk Priority" Rules
-
-1. **The Penny-Padding Rule:** If a memo contains a drug keyword and a decimal amount that does **not** align with Canadian tax rates (e.g., $120.36), it is flagged as **0.75 (Suspicious)**. The decimal is treated as an intentional attempt to bypass "Whole Integer" filters.
-2. **The Anchor Requirement:** A jagged decimal is only "Safe" if it is tax-aligned **OR** accompanied by a Category C Anchor.
-3. **The Whole Integer Penalty:** Any Category A/B word + a whole number (e.g., $32, $50) remains a **Strict 0.70+**.
-4. **Street Standard Multipliers:** $40, $60, $80, $150, $200 are the highest priority and move the score to **0.85+**.
-5. **Search for Reversals:** "Not for," "No drugs," or "Definitely not [keyword]" are treated as **Obfuscation** (Maintain 0.85-0.95).
-
----
-
-## 5. Systematic Decision Flow (v1.4)
-
-1. **Identify Category A/B:** If found, start at **0.70**.
-2. **Search for Anchor (Category C):** If found → Drop to **0.10**.
-3. **Evaluate Decimals (The Forensic Check):**
-* If `.00` → **Maintain 0.70+**.
-* If Decimals exist: Run **Tax-Alignment Check**.
-* Matches 5%, 11%, 12%, 13%, 14%, 14.975%, 15%? → **Drop to 0.35**.
-* No Tax Match? → **Raise to 0.75 (Penny-Padding/Obfuscation)**.
-
-4. **Evaluate Quantity/Standard:** If Street Price ($40, $80, etc.) → Move to **0.85 - 0.95**.
-
----
-
-## 6. Practice Examples (v1.4 Applied)
-
-| Memo | Amount | Final Label | Logic |
+| Baseline | Category | Examples | Rationale |
 | --- | --- | --- | --- |
-| **"Mushrooms Monday"** | $120.36 | **0.75** | Category B + **Penny-Padding** (Not tax aligned). |
-| **"Weed for party"** | $113.00 | **0.35** | Category B + **Tax Aligned** ($100 + 13%). |
-| **"Coke"** | $40.00 | **0.95** | Category A + **Street Standard**. |
-| **"White"** | $32.00 | **0.70** | Category A + **Integer Penalty**. |
-| **"Script for Percs"** | $46.58 | **0.15** | Category A + **Anchor (Script)** + **Tax Aligned**. |
-| **"Not for drugs"** | $40.00 | **0.95** | **Obfuscation Reversal** + Street Standard. |
-| **"Snow"** | $80.25 | **0.75** | Category A + **Penny-Padding** (Not tax aligned). |
+| **0.90** | High-Lethality / Diversion | coke, meth, fent, percs, oxy, adderall | highest harm / diversion risk |
+| **0.80** | Regulated / Generic | “drugs”, “weed”, shrooms, benzos | frequent Canadian shorthand |
+| **0.70** | Ambiguous Mask | “snow”, “white”, “candy”, “crackers” | phonetic shields; needs confirmation |
 
 ---
 
-**Would you like me to generate a PySpark function that iterates through these seven specific Canadian tax multipliers to automate the `is_tax_aligned` feature for your model?**
+## 3) Anchors & Masking Context (Verification)
+
+### 3.1 Anchor Types
+
+* **Anchor A (Institution / Merchant):** Shoppers/SDM, Rexall, Walmart, Costco, pharmacy.
+* **Anchor B (Clinical / Technical):** Rx, prescription, injection, refill, dosage, invoice.
+* **Anchor C (Search-Required Proper Nouns):** Specific brands or toys (e.g., Labubu, Sonny Angel, Stanley).
+
+### 3.2 Search Instruction (MANDATORY for Anchor C)
+
+If a memo contains a word that looks like a proper noun but is paired with a drug keyword (e.g., "Coke Labubu"), **you must use your search tool** to:
+
+1. Verify if the proper noun exists as a legitimate consumer product.
+2. Check if that product typically retails for an amount close to the memo value.
+
+
+### 3.3: The Micro-Transaction Filter (<$15)
+
+* **Rule:** If keyword = **"Drugs"** (Generic only) AND Amount **< $15** AND No Anchor  **Label 0.35**.
+* **The Exclusion:** **"Weed" and "Hard Drugs" are excluded.** Because $10 is a standard price for 1–2 street grams of cannabis or a "point" of meth/fentanyl in 2025, small transfers for these terms remain at their baseline (**0.80/0.90**).
+
+### 3.4: The "Street Magnetic" Price Match
+
+If the amount matches a 2025 street unit, it overrides all "joke" context and raises the risk.
+
+| Amount | 2025 Street Unit Match (Examples) | Final Label |
+| --- | --- | --- |
+| **$20.00** | 1 "Point" (Fent/Meth) or 2.5g (Weed) | **0.85 - 0.95** |
+| **$40.00** | 0.5g (Coke) or 7g (Budget Weed) | **0.85 - 0.95** |
+| **$80.00** | 1.0g (Coke/Meth) or 14g (Weed) | **0.85 - 0.95** |
+| **$100.00** | 1.0g (Premium Coke) or 28g (Ounce) | **0.85 - 0.95** |
+---
+
+Otherwise, use a web search result to see if price fall into a typical price range for the drug/slang mentioned in memo.
+
+## 4) The Dual-Key Forensic Verification
+
+### Key A — Machine Signature (Reverse-Tax + Charm Ending)
+
+Try these plausible Canadian sales tax rates: **0.05, 0.11, 0.12, 0.13, 0.14, 0.15**.
+
+* `subtotal_t = round(amount / (1 + t), 2)`
+* **Pass Condition:** `subtotal_t` ends in `.99, .49, .97, .95,` or `.00`. (±$0.01 tolerance allowed).
+
+### Key B — Context Anchor (Search-Backed)
+
+* **Pass Condition:** The memo contains a clinical term (Anchor B) or a proper noun (Anchor C) that has been **verified via web search** as a legitimate product or service.
+
+---
+
+## 5) Proper Nouns vs. Paired Context (Masking Strength)
+
+### 5.1: Proper Noun Trends (Safe)
+
+If the keyword is a specific, verifiable brand or pop-culture proper noun (e.g., **"Labubu"**, **"Sonny Angel"**, **"Stanley"**) and the price aligns with retail/resale:
+
+* **RESULT:** Drop to **0.35**. (Low risk of drug obfuscation using a $100 toy brand).
+
+### 5.2: Paired Contextual Masks (High Risk)
+
+If a drug keyword is paired with an "Enabling Word" (e.g., **"Custom"**, **"Carved"**, **"Cleaning"**, **"Delivery"**) but the amount is a **Street Magnetic Integer**:
+
+* **LOGIC:** The "Enabling Word" is a **Transactional Mask** designed to provide a hobby/service alibi for a round-number trade.
+* **RESULT:** Maintain/Raise to **0.85 - 0.95**.
+
+---
+
+## 6) Systematic Decision Flow (v3.3)
+
+1. **Identify Keywords:** Set initial Baseline (**0.70-0.90**).
+2. **Web Search:** If a proper noun/brand is present, verify its legitimacy and typical price.
+3. **Run Dual-Key Check:**
+* **Math:** Does the amount align with a taxed retail "charm" number?
+* **Context:** Does search/text provide a verifiable anchor?
+
+
+4. **Final Labeling:**
+* **A + B (Verified):** Drop to **0.15–0.35**.
+* **Failed A (Messy Math):** Maintain Baseline or apply **Integer Penalty (≥ 0.85)** if it's a round number like $40, $80, $100.
+* **Pharmacy Rule:** Oxy/Adderall etc. require explicit Pharmacy Anchors + Tax Alignment to drop below **0.75**.
+
+
+---
+## 7) Please feel free to be critical and give me your suggestions if you feel it's appropriate to.
+
+---
+
+## 8) Examples
+
+| Memo | Amount | Search Action | Final | Why |
+| --- | --- | --- | --- | --- |
+| "Coke Labubu" | $112.99 | Search "Labubu" (Verified: Toy) | **0.25** | Verified product + Key A Pass (13% tax = $99.99). |
+| "Coke Labubu" | $110.00 | Search "Labubu" (Verified: Toy) | **0.65** | Verified product BUT Key A Fail (round number). Camouflage risk. |
+| "Oxy Refill" | $45.19 | N/A (Clinical term) | **0.15** | Key A Pass (13% = $39.99) + Anchor B. |
+
+---
+
+We will begin to give you EMT memo and amount for you to label once you are ready.
+---
+
+
+
+
+
+
+
