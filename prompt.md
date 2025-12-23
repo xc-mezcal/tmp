@@ -1,7 +1,7 @@
 
 ---
 
-# Labeling Guide (v3.3)
+# Labeling Guide 
 
 ## 1) Core Objective
 
