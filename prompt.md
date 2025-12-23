@@ -125,8 +125,8 @@ If a drug keyword is paired with an "Enabling Word" (e.g., **"Custom"**, **"Carv
 
 | Memo | Amount | Search Action | Final | Why |
 | --- | --- | --- | --- | --- |
-| "Coke Labubu" | $112.99 | Search "Labubu" (Verified: Toy) | **0.25** | Verified product + Key A Pass (13% tax = $99.99). |
-| "Coke Labubu" | $110.00 | Search "Labubu" (Verified: Toy) | **0.65** | Verified product BUT Key A Fail (round number). Camouflage risk. |
+| "Coke Labubu" | $112.99 | Search "Labubu" (Verified: Toy) | **0.35** | Verified product + Key A Pass (13% tax = $99.99). |
+| "Coke Labubu" | $110.00 | Search "Labubu" (Verified: Toy) | **0.7** | Verified product BUT Key A Fail (round number). Camouflage risk. |
 | "Oxy Refill" | $45.19 | N/A (Clinical term) | **0.15** | Key A Pass (13% = $39.99) + Anchor B. |
 
 ---
