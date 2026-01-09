@@ -1,7 +1,7 @@
 
 ---
 
-# Labeling Guide 
+# Labeling Guide (v3.3)
 
 ## 1) Core Objective
 
@@ -25,12 +25,21 @@ Label EMT memos for potential illicit drug activity using a **Severity-Based Bas
 ## 2) Severity-Based Starting Points (Baseline)
 
 When a drug-related keyword (or slang mask) is present, start here:
+This revised section reflects our 2026 "Gravity Tier" strategy. It separates "Zero-Alibi" drugs from "Retail-Alibi" prescriptions and uses a 4-tier structure to give the forensic math more room to operate.
 
-| Baseline | Category | Examples | Rationale |
-| --- | --- | --- | --- |
-| **0.90** | High-Lethality / Diversion | coke, meth, fent, percs, oxy, adderall | highest harm / diversion risk |
-| **0.80** | Regulated / Generic | “drugs”, “weed”, shrooms, benzos | frequent Canadian shorthand |
-| **0.70** | Ambiguous Mask | “snow”, “white”, “candy”, “crackers” | phonetic shields; needs confirmation |
+---
+
+## 2) Severity-Based Starting Points (Baseline)
+
+When a drug-related keyword (or slang mask) is present, establish the initial "Gravity" here. 
+
+| Baseline | Tier | Category | Examples | Rationale |
+| --- | --- | --- | --- | --- |
+| **0.95** | **1** | **Lethal / Atomic** | Fent, Down, Nitazenes (Zenes), Carfent, Iso | **Highest Priority.** Zero legal retail presence. High toxicity and FINTRAC "Project Guardian" focus. |
+| **0.85** | **2** | **Prohibited Street** | Meth, Jib, Coke, Crack, Blow, Rock, Heroin, H | **Zero-Alibi.** Strictly prohibited Schedule I substances with no legal consumer retail path. |
+| **0.80** | **3** | **Specific Diversion** | Adderall, Addy, Oxy, Percs, Xanax, Bars, Vyvanse | **Retail-Alibi.** Clear drug terms but common as legal prescriptions. High diversion risk but allows for a "Pharmacy Anchor" drop. |
+| **0.70** | **4** | **Ambiguous / Masked** | Snow, White, Candy, Beans, Glass, Ice, Gear, Skittles | **Forensic-Required.** Words with high "Dual-Use" potential. Relies heavily on **Key A (Math)** to determine if the context is innocent. |
+
 
 ---
 
@@ -117,7 +126,9 @@ If a drug keyword is paired with an "Enabling Word" (e.g., **"Custom"**, **"Carv
 
 
 ---
-## 7) Please feel free to be critical and give me your suggestions if you feel it's appropriate to.
+## 7) Others
+* Please feel free to be critical and give me your suggestions if you feel it's appropriate to.
+* Please don't pre-assume that any trxn in Ontario, don't use my geo info to add additional information, it's across Caanda provinces, which means the tax is could be others than 13% too. 
 
 ---
 
@@ -125,7 +136,7 @@ If a drug keyword is paired with an "Enabling Word" (e.g., **"Custom"**, **"Carv
 
 | Memo | Amount | Search Action | Final | Why |
 | --- | --- | --- | --- | --- |
-| "Coke Labubu" | $112.99 | Search "Labubu" (Verified: Toy) | **0.35** | Verified product + Key A Pass (13% tax = $99.99). |
+| "Coke Labubu" | $112.99 | Search "Labubu" (Verified: Toy) | **0.3** | Verified product + Key A Pass (13% tax = $99.99). |
 | "Coke Labubu" | $110.00 | Search "Labubu" (Verified: Toy) | **0.7** | Verified product BUT Key A Fail (round number). Camouflage risk. |
 | "Oxy Refill" | $45.19 | N/A (Clinical term) | **0.15** | Key A Pass (13% = $39.99) + Anchor B. |
 
@@ -133,10 +144,3 @@ If a drug keyword is paired with an "Enabling Word" (e.g., **"Custom"**, **"Carv
 
 We will begin to give you EMT memo and amount for you to label once you are ready.
 ---
-
-
-
-
-
-
-
