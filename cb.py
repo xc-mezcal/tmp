@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
-from matplotlib.gridspec import GridSpec
 
 # ─────────────────────────────────────────────────────────────
 # CONFIG
@@ -39,26 +38,18 @@ def load_scores() -> pd.DataFrame:
     Return a DataFrame with at least a 'score' column (float 0–1).
     Include any ID / memo columns you need for downstream sampling.
     
-    Example with synthetic data for demonstration:
+    ── REPLACE THIS with your actual data loading logic ──
+    Example:
+        df = pd.read_parquet("new_month_scores.parquet")
+        # or
+        df = pd.read_csv("new_month_scores.csv")
+        # ensure there's a 'score' column and a 'record_id' column
+        return df
     """
-    rng = np.random.default_rng(RANDOM_SEED)
-    n = 10_000_000
-
-    # Simulate a heavily left-skewed distribution:
-    #   ~99% near 0, a thin tail, ~800 above 0.65
-    bulk     = rng.beta(0.3, 12, size=int(n * 0.9992))          # mass near 0
-    mid_tail = rng.uniform(0.10, 0.65, size=int(n * 0.0006))    # sparse mid-range
-    pos_tail = rng.beta(5, 3, size=int(n * 0.0002)) * 0.35 + 0.65  # ~800 positives
-
-    scores = np.concatenate([bulk, mid_tail, pos_tail])
-    np.clip(scores, 0, 1, out=scores)
-    rng.shuffle(scores)
-
-    df = pd.DataFrame({
-        "record_id": np.arange(len(scores)),
-        "score": scores,
-    })
-    return df
+    raise NotImplementedError(
+        "Replace load_scores() with your actual data loading logic. "
+        "Must return a DataFrame with at least 'record_id' and 'score' columns."
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -118,15 +109,15 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
     Four-panel figure:
       A) Log-scale histogram (full range)
       B) Zoomed linear histogram (0.3 – 1.0, the "tail")
-      C) ECDF with zoomed inset on upper tail
+      C) Reverse cumulative count — "records scoring >= X" (log y)
       D) Strata allocation preview
     """
-    fig = plt.figure(figsize=(16, 12), facecolor="white")
-    gs = GridSpec(2, 2, hspace=0.38, wspace=0.32,
-                  left=0.08, right=0.94, top=0.92, bottom=0.08)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    fig.subplots_adjust(hspace=0.40, wspace=0.34,
+                        left=0.08, right=0.94, top=0.91, bottom=0.07)
 
     # ── A: Log-scale histogram ──────────────────────────────
-    ax1 = fig.add_subplot(gs[0, 0])
+    ax1 = axes[0, 0]
     bins_a = np.linspace(0, 1, 101)
     ax1.hist(scores, bins=bins_a, color="#4C72B0", edgecolor="none", alpha=0.85)
     ax1.set_yscale("log")
@@ -134,17 +125,17 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
     ax1.set_xlabel("Prediction Score", fontsize=11)
     ax1.set_ylabel("Count  (log scale)", fontsize=11)
     ax1.set_title("A — Full Distribution (Log Scale)", fontsize=13, fontweight="bold")
-    ax1.legend(fontsize=10)
+    ax1.legend(fontsize=10, loc="upper right")
     ax1.set_xlim(-0.02, 1.02)
 
-    # Annotate above-threshold count
+    # Annotate above-threshold count (place inside axes bounds)
     above_n = int(np.sum(scores >= THRESHOLD))
-    ax1.annotate(f"{above_n:,} above threshold",
-                 xy=(THRESHOLD + 0.02, ax1.get_ylim()[1] * 0.3),
-                 fontsize=10, color="#C44E52", fontweight="bold")
+    ylo, yhi = ax1.get_ylim()
+    ax1.text(THRESHOLD + 0.03, yhi * 0.08, f"{above_n:,}\nabove threshold",
+             fontsize=9.5, color="#C44E52", fontweight="bold", va="top")
 
     # ── B: Zoomed tail histogram (linear) ───────────────────
-    ax2 = fig.add_subplot(gs[0, 1])
+    ax2 = axes[0, 1]
     tail_scores = scores[scores >= 0.30]
     bins_b = np.linspace(0.30, 1.0, 71)
     ax2.hist(tail_scores, bins=bins_b, color="#55A868", edgecolor="white", lw=0.3)
@@ -162,36 +153,52 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
         if cnt > 0:
             mid = (lo + hi) / 2
             ax2.text(mid, cnt + max(1, cnt * 0.08), f"{cnt:,}",
-                     ha="center", va="bottom", fontsize=7.5, fontweight="bold", rotation=45)
+                     ha="center", va="bottom", fontsize=7.5, fontweight="bold", rotation=45,
+                     clip_on=True)
 
-    # ── C: ECDF with inset ──────────────────────────────────
-    ax3 = fig.add_subplot(gs[1, 0])
-    sorted_s = np.sort(scores)
-    ecdf_y = np.arange(1, len(sorted_s) + 1) / len(sorted_s)
+    # ── C: Reverse Cumulative Count (Survival) ──────────────
+    # "If I set the threshold to X, how many records get flagged?"
+    ax3 = axes[1, 0]
+    sorted_s = np.sort(scores)[::-1]  # descending
+    rev_cum_y = np.arange(1, len(sorted_s) + 1)
 
-    # Downsample for plotting efficiency (plot every 1000th point)
-    step = max(1, len(sorted_s) // 10000)
-    ax3.plot(sorted_s[::step], ecdf_y[::step], color="#4C72B0", lw=1.5)
-    ax3.axvline(THRESHOLD, color="#C44E52", ls="--", lw=1.5)
-    ax3.set_xlabel("Prediction Score", fontsize=11)
-    ax3.set_ylabel("Cumulative Proportion", fontsize=11)
-    ax3.set_title("C — Empirical CDF", fontsize=13, fontweight="bold")
+    # Downsample for plot efficiency but keep tail detail
+    # Use log-spaced indices so the tail (small counts) gets more points
+    n = len(sorted_s)
+    idx = np.unique(np.concatenate([
+        np.geomspace(1, n, num=5000, dtype=int) - 1,   # log-spaced for tail
+        np.linspace(0, n - 1, num=5000, dtype=int),     # uniform for bulk
+    ]))
+    idx = np.sort(idx)
 
-    # Inset: zoom into 0.5 – 1.0
-    ax3_inset = ax3.inset_axes([0.35, 0.15, 0.60, 0.55])
-    mask = sorted_s >= 0.40
-    ax3_inset.plot(sorted_s[mask][::max(1, mask.sum()//2000)],
-                   ecdf_y[mask][::max(1, mask.sum()//2000)],
-                   color="#4C72B0", lw=1.5)
-    ax3_inset.axvline(THRESHOLD, color="#C44E52", ls="--", lw=1.2)
-    ax3_inset.set_xlim(0.40, 1.0)
-    frac_above = np.mean(scores >= THRESHOLD)
-    ax3_inset.axhline(1 - frac_above, color="grey", ls=":", lw=1)
-    ax3_inset.set_title("Zoom: 0.40 – 1.0", fontsize=9)
-    ax3_inset.tick_params(labelsize=8)
+    ax3.plot(sorted_s[idx], rev_cum_y[idx], color="#4C72B0", lw=1.8)
+    ax3.set_yscale("log")
+    ax3.axvline(THRESHOLD, color="#C44E52", ls="--", lw=2)
+    ax3.set_xlabel("Score Threshold (X)", fontsize=11)
+    ax3.set_ylabel("Records with score ≥ X  (log)", fontsize=11)
+    ax3.set_title("C — Reverse Cumulative Count", fontsize=13, fontweight="bold")
+    ax3.set_xlim(-0.02, 1.02)
+
+    # Annotate key readoff points
+    readoff_thresholds = [0.10, 0.30, 0.50, THRESHOLD, 0.80]
+    for t in readoff_thresholds:
+        cnt = int(np.sum(scores >= t))
+        if cnt > 0:
+            color = "#C44E52" if t == THRESHOLD else "#555555"
+            weight = "bold" if t == THRESHOLD else "normal"
+            ax3.plot(t, cnt, "o", color=color, ms=5, zorder=5)
+            # Offset label to avoid overlap
+            y_offset = 2.0 if t != THRESHOLD else 2.5
+            ax3.annotate(f"{cnt:,}", xy=(t, cnt), fontsize=8.5, color=color,
+                         fontweight=weight, ha="center",
+                         xytext=(0, 10), textcoords="offset points")
+
+    ax3.text(0.03, 0.05, '"If threshold = X,\n how many flagged?"',
+             transform=ax3.transAxes, fontsize=9, style="italic",
+             color="#666666", va="bottom")
 
     # ── D: Strata allocation bar chart ──────────────────────
-    ax4 = fig.add_subplot(gs[1, 1])
+    ax4 = axes[1, 1]
     labels, populations, allocations = [], [], []
     for name, lo, hi, alloc in STRATA_CONFIG:
         cnt = int(np.sum((scores >= lo) & (scores < hi)))
@@ -217,10 +224,10 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
 
     # Annotate bars
     for bar, val in zip(bars1, populations):
-        ax4.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.3,
+        ax4.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.4,
                  f"{val:,}", ha="center", va="bottom", fontsize=8, color="#4C72B0")
     for bar, val in zip(bars2, allocations):
-        ax4b.text(bar.get_x() + bar.get_width() / 2, val + 3,
+        ax4b.text(bar.get_x() + bar.get_width() / 2, val + 4,
                   str(val), ha="center", va="bottom", fontsize=9,
                   fontweight="bold", color="#DD8452")
 
@@ -234,7 +241,7 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
     ax4.legend(lines1 + lines2, labs1 + labs2, fontsize=10, loc="upper left")
 
     fig.suptitle("Phase 2 — New Month Score Distribution & Sampling Plan",
-                 fontsize=16, fontweight="bold", y=0.98)
+                 fontsize=15, fontweight="bold")
     plt.savefig(save_path, dpi=180, bbox_inches="tight")
     print(f"\n[✓] Plot saved → {save_path}")
     plt.close()
