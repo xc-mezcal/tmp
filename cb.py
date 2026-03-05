@@ -162,9 +162,9 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
     ax2.set_title("B — Tail Zoom [0.30 – 1.0] (Linear Scale)", fontsize=13, fontweight="bold")
     ax2.legend(fontsize=10)
 
-    # Smart annotations: use wider aggregated bins, horizontal text,
-    # and place labels at a consistent offset above each bar group.
-    # Finer bins near threshold where resolution matters.
+    # Smart annotations: use wider aggregated bins, horizontal text.
+    # Place labels at fixed y positions near the top so they're always visible,
+    # alternating two rows to avoid horizontal overlap in tight bins.
     annot_bins = [
         (0.30, 0.35),
         (0.35, 0.40),
@@ -176,14 +176,19 @@ def plot_distribution(scores: np.ndarray, save_path: str = "phase2_score_distrib
         (0.85, 1.001),
     ]
     y_max = ax2.get_ylim()[1]
-    for lo, hi in annot_bins:
+    row_high = y_max * 0.92
+    row_low  = y_max * 0.80
+    for i, (lo, hi) in enumerate(annot_bins):
         cnt = int(np.sum((scores >= lo) & (scores < min(hi, 1.0001))))
         if cnt > 0:
             mid_x = (lo + min(hi, 1.0)) / 2
-            label_y = cnt + y_max * 0.025
+            # Alternate rows so adjacent labels don't collide
+            label_y = row_high if i % 2 == 0 else row_low
             ax2.text(mid_x, label_y, f"{cnt:,}",
-                     ha="center", va="bottom", fontsize=8, fontweight="bold",
-                     rotation=0, clip_on=True)
+                     ha="center", va="center", fontsize=8, fontweight="bold",
+                     color="#333333",
+                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray",
+                               alpha=0.8, lw=0.5))
 
     # ── C: Reverse Cumulative Count (Survival) ──────────────
     ax3 = axes[1, 0]
