@@ -6,15 +6,24 @@ parses them via sqlglot, and reports base tables + columns used.
 
 Handles:
 - Multiple EXECUTE IMMEDIATE blocks per file
-- || concatenation with PL/SQL variable interpolation
+- || concatenation at PL/SQL level (variable interpolation)
+- || concatenation inside SQL (Oracle string concat) — preserved correctly
 - Escaped quotes ('') inside string literals
+- SQL comments (-- and /* */) inside the query
+- Oracle hints (/*+ ... */)
+- REGEXP patterns with special characters
 - CTE (WITH ... AS) resolution back to base tables
-- Standard Oracle functions (TO_CHAR, TO_DATE, NVL, etc.)
+- INSERT INTO ... WITH ... SELECT patterns
 
-Output: JSON file with base tables and column mappings.
+Output: JSON file + DataFrame for notebook use.
 
-Usage:
+Usage (CLI):
     python oracle_sql_analyzer.py <input.sql> [--output results.json]
+
+Usage (notebook):
+    from oracle_sql_analyzer import analyze_file
+    report, df = analyze_file("my_script.sql")
+    df  # displays the DataFrame
 """
 
 import re
@@ -32,6 +41,12 @@ try:
 except ImportError:
     SQLGLOT_AVAILABLE = False
 
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -42,36 +57,44 @@ logger = logging.getLogger(__name__)
 
 def extract_execute_immediate_blocks(plsql_text: str) -> list[str]:
     """
-    Find all EXECUTE IMMEDIATE '...' blocks and return the raw string content.
-    Handles:
-      - Multi-line strings
-      - '' escaped quotes inside the string
-      - || concatenation that continues the string
-      - Skips matches inside comments
-    """
-    # Normalize line endings
-    text = plsql_text.replace('\r\n', '\n')
+    Find all EXECUTE IMMEDIATE '...' blocks and return the reconstructed SQL.
 
+    Strategy:
+    ---------
+    The EXECUTE IMMEDIATE statement in PL/SQL builds a SQL string via:
+        EXECUTE IMMEDIATE '<sql_frag>' || plsql_expr || '<sql_frag>' ...
+
+    At the PL/SQL OUTER level:
+    - String literals are delimited by single quotes
+    - Inside those literals, '' is an escaped single quote
+    - || between string literals is PL/SQL concatenation
+    - Anything between || that is NOT a string literal is a PL/SQL expression
+
+    At the SQL INNER level (inside the string literals):
+    - || is Oracle SQL string concatenation (PRESERVED as-is)
+    - '' has already been unescaped to ' during extraction
+    - -- comments, /*+ hints */, regexp patterns are all SQL content
+    """
+    text = plsql_text.replace('\r\n', '\n')
     blocks = []
 
-    # Pattern: EXECUTE IMMEDIATE followed by a string built with || concatenation
     pattern = re.compile(r"EXECUTE\s+IMMEDIATE\s*", re.IGNORECASE)
 
     for match in pattern.finditer(text):
-        # Skip if this match is inside a single-line comment (-- ...)
+        # Skip if inside a single-line comment
         line_start = text.rfind('\n', 0, match.start()) + 1
         line_prefix = text[line_start:match.start()]
         if '--' in line_prefix:
             continue
 
-        # Skip if inside a block comment (/* ... */)
+        # Skip if inside a block comment
         last_open = text.rfind('/*', 0, match.start())
         last_close = text.rfind('*/', 0, match.start())
         if last_open > last_close:
             continue
 
         start_pos = match.end()
-        raw_block = _extract_concatenated_string(text, start_pos)
+        raw_block = _extract_exec_imm_statement(text, start_pos)
         if raw_block is not None and len(raw_block.strip()) > 10:
             blocks.append(raw_block)
 
@@ -79,163 +102,178 @@ def extract_execute_immediate_blocks(plsql_text: str) -> list[str]:
     return blocks
 
 
-def _extract_concatenated_string(text: str, pos: int) -> Optional[str]:
+def _extract_exec_imm_statement(text: str, pos: int) -> Optional[str]:
     """
-    Starting at `pos`, parse a PL/SQL concatenated string expression like:
-        'SELECT ...' || expr || ' WHERE ...' || expr || ' ...'
-    Returns the assembled string with interpolated expressions replaced by placeholders.
-    """
-    fragments = []
-    i = _skip_whitespace(text, pos)
+    Parse the full EXECUTE IMMEDIATE statement starting at pos.
 
-    if i >= len(text):
+    Tokenizes at the PL/SQL level into STRING / CONCAT / EXPR / END,
+    then reassembles: string content kept as SQL, expressions replaced
+    with placeholders.
+    """
+    tokens = _tokenize_plsql_expr(text, pos)
+
+    if not tokens:
         return None
 
+    sql_parts = []
+    for tok_type, tok_value in tokens:
+        if tok_type == 'STRING':
+            sql_parts.append(tok_value)
+        elif tok_type == 'EXPR':
+            placeholder = _expression_to_placeholder(tok_value)
+            sql_parts.append(placeholder)
+
+    result = ''.join(sql_parts)
+    return result if result.strip() else None
+
+
+def _tokenize_plsql_expr(text: str, pos: int) -> list[tuple[str, str]]:
+    """
+    Tokenize the RHS of EXECUTE IMMEDIATE into typed tokens.
+    """
+    tokens = []
+    i = _skip_ws(text, pos)
+
     while i < len(text):
-        i = _skip_whitespace(text, i)
+        i = _skip_ws(text, i)
         if i >= len(text):
             break
 
         if text[i] == "'":
-            # Parse a string literal
-            literal, end_pos = _parse_string_literal(text, i)
-            if literal is None:
-                logger.warning(f"Failed to parse string literal at position {i}")
+            content, end_pos = _parse_plsql_string(text, i)
+            if content is not None:
+                tokens.append(('STRING', content))
+                i = end_pos
+            else:
                 break
-            fragments.append(literal)
-            i = end_pos
+
         elif text[i] == '|' and i + 1 < len(text) and text[i + 1] == '|':
-            # Concatenation operator — skip it
+            tokens.append(('CONCAT', '||'))
             i += 2
-            continue
+
         elif text[i] == ';':
-            # End of the EXECUTE IMMEDIATE statement
+            tokens.append(('END', ';'))
             break
+
         else:
-            # This is an interpolated PL/SQL expression (variable, function call, etc.)
-            expr, end_pos = _parse_plsql_expression(text, i)
-            # Replace the expression with a placeholder
-            placeholder = _expression_to_placeholder(expr)
-            fragments.append(placeholder)
+            expr, end_pos = _parse_plsql_interp_expr(text, i)
+            if expr:
+                tokens.append(('EXPR', expr))
             i = end_pos
 
-    if not fragments:
-        return None
-
-    return ''.join(fragments)
+    return tokens
 
 
-def _skip_whitespace(text: str, pos: int) -> int:
-    """Skip whitespace and newlines."""
+def _skip_ws(text: str, pos: int) -> int:
     while pos < len(text) and text[pos] in ' \t\n\r':
         pos += 1
     return pos
 
 
-def _parse_string_literal(text: str, pos: int) -> tuple[Optional[str], int]:
+def _parse_plsql_string(text: str, pos: int) -> tuple[Optional[str], int]:
     """
-    Parse a PL/SQL string literal starting at pos (which should be a quote).
-    Handles '' escape sequences (PL/SQL doubled single quotes).
-    Returns (unescaped_string, position_after_closing_quote).
+    Parse a PL/SQL string literal starting at pos (must be ').
+    '' inside becomes ' (PL/SQL escape rule).
+    Everything else is raw SQL content — preserved verbatim.
     """
-    if text[pos] != "'":
+    if pos >= len(text) or text[pos] != "'":
         return None, pos
 
     result = []
     i = pos + 1
     while i < len(text):
         if text[i] == "'":
-            # Check for escaped quote ''
             if i + 1 < len(text) and text[i + 1] == "'":
                 result.append("'")
                 i += 2
             else:
-                # End of literal
                 return ''.join(result), i + 1
         else:
             result.append(text[i])
             i += 1
 
-    # Unterminated string
-    logger.warning(f"Unterminated string literal starting at position {pos}")
+    logger.warning(f"Unterminated PL/SQL string literal at position {pos}")
     return ''.join(result), i
 
 
-def _parse_plsql_expression(text: str, pos: int) -> tuple[str, int]:
+def _parse_plsql_interp_expr(text: str, pos: int) -> tuple[str, int]:
     """
-    Parse a PL/SQL expression that appears between || operators.
-    This could be: a variable name, a function call like TO_CHAR(...), etc.
-    We read until we hit || or ; while respecting parentheses.
+    Parse a PL/SQL interpolated expression between || operators.
+    Respects parentheses and string literals inside function calls.
     """
     i = pos
     paren_depth = 0
-    start = pos
 
     while i < len(text):
         ch = text[i]
+
         if ch == '(':
             paren_depth += 1
             i += 1
         elif ch == ')':
             paren_depth -= 1
+            if paren_depth < 0:
+                paren_depth = 0
             i += 1
         elif ch == "'" and paren_depth > 0:
-            # String literal inside a function call — skip it
-            _, i = _parse_string_literal(text, i)
-        elif paren_depth == 0 and ch == '|' and i + 1 < len(text) and text[i + 1] == '|':
-            break
-        elif paren_depth == 0 and ch == ';':
-            break
-        elif paren_depth == 0 and ch == '\n':
-            # Check if this is really the end or just a linebreak in the expression
-            # Look ahead for || on the next line
-            lookahead = _skip_whitespace(text, i + 1)
-            if lookahead < len(text) and text[lookahead] == '|' and lookahead + 1 < len(text) and text[lookahead + 1] == '|':
-                i = lookahead
+            _, i = _parse_plsql_string(text, i)
+        elif paren_depth == 0:
+            if ch == '|' and i + 1 < len(text) and text[i + 1] == '|':
                 break
-            elif lookahead < len(text) and text[lookahead] == "'":
-                # Next part is a string literal connected by implicit continuation
-                i = lookahead
+            elif ch == ';':
                 break
+            elif ch == "'":
+                break
+            elif ch == '\n':
+                lookahead = _skip_ws(text, i + 1)
+                if lookahead < len(text) and text[lookahead] in "|';":
+                    i = lookahead
+                    break
+                else:
+                    i += 1
             else:
                 i += 1
         else:
             i += 1
 
-    expr = text[start:i].strip()
+    expr = text[pos:i].strip()
     return expr, i
 
 
 def _expression_to_placeholder(expr: str) -> str:
     """
     Convert a PL/SQL interpolated expression into a SQL-safe placeholder.
-
-    IMPORTANT: The placeholder is injected between string literal fragments,
-    so the surrounding context often already provides quotes.
-    e.g., PL/SQL: ''' || TO_CHAR(alert_date, 'dd-mon-yy') || '''
-          becomes: ' + placeholder + '  (the quotes come from the string fragments)
-
-    So we return bare values — no wrapping quotes — for expressions that are
-    typically interpolated inside quoted contexts.
-    For numeric variables, we return a bare number.
+    Returns a bare value (no wrapping quotes) — the surrounding SQL string
+    fragments provide whatever quoting context is needed.
     """
     expr_upper = expr.upper().strip()
 
-    # TO_CHAR / TO_DATE patterns — return bare date string (context provides quotes)
-    if 'TO_CHAR' in expr_upper or 'TO_DATE' in expr_upper:
+    if 'TO_CHAR' in expr_upper:
+        return '01-JAN-25'
+    if 'TO_DATE' in expr_upper:
         return '01-JAN-25'
 
-    # Numeric variable names (heuristic: if name contains amt, num, count, id, etc.)
-    numeric_hints = ['AMT', 'NUM', 'COUNT', 'ID', 'LIMIT', 'MIN', 'MAX', 'THRESHOLD',
-                     'DAYS', 'FREQ', 'PERIOD', 'IND', 'AMOUNT', 'SCORE']
+    # Functions that return numbers
+    if any(fn in expr_upper for fn in [
+        'LENGTH', 'REGEXP', 'NVL', 'COALESCE', 'DECODE',
+        'GREATEST', 'LEAST', 'ABS', 'ROUND', 'TRUNC',
+        'MOD', 'CEIL', 'FLOOR', 'SUBSTR', 'INSTR',
+    ]):
+        return '0'
+
+    # Numeric variable heuristic
+    numeric_hints = [
+        'AMT', 'NUM', 'COUNT', 'ID', 'LIMIT', 'MIN', 'MAX',
+        'THRESHOLD', 'DAYS', 'FREQ', 'PERIOD', 'IND', 'AMOUNT',
+        'SCORE', 'PCT', 'RATE', 'QTY', 'SIZE', 'LEN', 'SCENARIO',
+    ]
     if any(hint in expr_upper for hint in numeric_hints):
         return '0'
 
-    # If it looks like a simple variable (no parens), assume numeric in most PL/SQL contexts
-    if '(' not in expr:
+    # Simple identifier — default numeric
+    if '(' not in expr and re.match(r'^[A-Za-z_][A-Za-z0-9_.]*$', expr.strip()):
         return '0'
 
-    # Function call we don't recognize — return bare placeholder
     return 'PLACEHOLDER'
 
 
@@ -245,42 +283,52 @@ def _expression_to_placeholder(expr: str) -> str:
 
 def clean_sql_for_parsing(raw_sql: str) -> str:
     """
-    Additional cleanup to make the extracted SQL parseable by sqlglot.
+    Clean extracted SQL for sqlglot parsing.
+    - Strip INSERT INTO ... before WITH/SELECT
+    - Remove Oracle hints /*+ ... */
+    - Remove SQL comments
+    - Normalize whitespace
     """
-    sql = raw_sql.strip()
+    sql = raw_sql.strip().rstrip(';').strip()
 
-    # Remove trailing semicolons (sqlglot doesn't always like them)
-    sql = sql.rstrip(';').strip()
+    # Strip INSERT INTO <table> (with optional column list)
+    sql = re.sub(
+        r'(?i)^\s*INSERT\s+INTO\s+\S+\s*(\([^)]*\))?\s*(?=WITH\b|SELECT\b)',
+        '', sql
+    ).strip()
 
-    # Fix any double spaces or weird whitespace
-    sql = re.sub(r'\s+', ' ', sql)
+    # Remove Oracle optimizer hints /*+ ... */
+    sql = re.sub(r'/\*\+[^*]*?\*/', '', sql)
 
-    # Fix cases where placeholder substitution may have created bad syntax
-    # e.g., "to_date('01-JAN-25', '01-JAN-25')" — not ideal but parseable
-    # Also handle cases like WHERE col > 0 0 (double placeholder)
-    sql = re.sub(r"(\d)\s+(\d)", r"\1", sql)
+    # Remove single-line SQL comments
+    sql = re.sub(r'--[^\n]*', '', sql)
+
+    # Remove block comments (non-greedy)
+    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+
+    # Normalize whitespace
+    sql = re.sub(r'\s+', ' ', sql).strip()
 
     return sql
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Parse SQL with sqlglot and extract tables/columns
+# Phase 3: Parse with sqlglot
 # ---------------------------------------------------------------------------
 
 @dataclass
 class QueryAnalysis:
-    """Analysis results for a single EXECUTE IMMEDIATE block."""
     block_index: int
     raw_sql: str
     cleaned_sql: str
-    base_tables: list[dict] = field(default_factory=list)  # {name, schema, alias}
-    columns: list[dict] = field(default_factory=list)       # {column, table, resolved_base_table}
+    base_tables: list[dict] = field(default_factory=list)
+    columns: list[dict] = field(default_factory=list)
     cte_names: list[str] = field(default_factory=list)
     parse_errors: list[str] = field(default_factory=list)
 
 
 def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
-    """Parse a cleaned SQL string and extract base tables and columns."""
+    """Parse cleaned SQL and extract base tables and columns."""
     result = QueryAnalysis(
         block_index=block_index,
         raw_sql=cleaned_sql,
@@ -296,17 +344,16 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
     except Exception as e:
         result.parse_errors.append(f"sqlglot parse error: {e}")
         logger.warning(f"Block {block_index}: parse error — {e}")
-        # Try a more lenient parse with error_level
         try:
             parsed = sqlglot.parse_one(
                 cleaned_sql, read="oracle",
                 error_level=sqlglot.ErrorLevel.WARN
             )
         except Exception as e2:
-            result.parse_errors.append(f"sqlglot lenient parse also failed: {e2}")
+            result.parse_errors.append(f"Lenient parse also failed: {e2}")
             return result
 
-    # --- Extract CTEs ---
+    # --- CTEs ---
     cte_names = set()
     for cte in parsed.find_all(exp.CTE):
         alias = cte.alias
@@ -314,8 +361,15 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
             cte_names.add(alias.upper())
     result.cte_names = sorted(cte_names)
 
-    # --- Extract all table references ---
-    alias_to_table = {}  # alias -> (schema, table_name)
+    # INSERT INTO targets (temp tables, not base tables)
+    insert_targets = set()
+    for insert in parsed.find_all(exp.Insert):
+        tbl = insert.find(exp.Table)
+        if tbl:
+            insert_targets.add(tbl.name.upper())
+
+    # --- Tables ---
+    alias_to_table = {}
     all_tables = []
 
     for table in parsed.find_all(exp.Table):
@@ -324,7 +378,8 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
         alias = table.alias if table.alias else table_name
 
         if table_name.upper() in cte_names:
-            # This is a CTE reference, not a base table
+            continue
+        if table_name.upper() in insert_targets:
             continue
 
         entry = {
@@ -336,7 +391,6 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
         alias_to_table[alias.upper()] = (schema_name, table_name)
         alias_to_table[table_name.upper()] = (schema_name, table_name)
 
-    # Deduplicate tables
     seen = set()
     for t in all_tables:
         key = (t["schema"].upper() if t["schema"] else "", t["name"].upper())
@@ -344,8 +398,7 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
             seen.add(key)
             result.base_tables.append(t)
 
-    # --- Extract columns and resolve to base tables ---
-    # First, build CTE -> base table resolution map
+    # --- Columns ---
     cte_column_map = _build_cte_column_map(parsed, cte_names, alias_to_table)
 
     for col in parsed.find_all(exp.Column):
@@ -354,13 +407,12 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
 
         resolved_table = ""
         if table_ref:
-            table_ref_upper = table_ref.upper()
-            if table_ref_upper in alias_to_table:
-                schema, tname = alias_to_table[table_ref_upper]
+            tr_upper = table_ref.upper()
+            if tr_upper in alias_to_table:
+                schema, tname = alias_to_table[tr_upper]
                 resolved_table = f"{schema + '.' if schema else ''}{tname}"
-            elif table_ref_upper in cte_names:
-                # Try to resolve through CTE
-                base = cte_column_map.get((table_ref_upper, col_name.upper()))
+            elif tr_upper in cte_names:
+                base = cte_column_map.get((tr_upper, col_name.upper()))
                 resolved_table = base if base else f"CTE:{table_ref}"
             else:
                 resolved_table = table_ref
@@ -371,39 +423,27 @@ def analyze_sql(cleaned_sql: str, block_index: int) -> QueryAnalysis:
             "resolved_base_table": resolved_table,
         })
 
-    # Deduplicate columns
     result.columns = _deduplicate_columns(result.columns)
-
     return result
 
 
-def _build_cte_column_map(
-    parsed, cte_names: set, alias_to_table: dict
-) -> dict[tuple[str, str], str]:
-    """
-    Build a map of (CTE_NAME, COLUMN_NAME) -> base_table_name
-    by inspecting the SELECT list of each CTE definition.
-    This is a best-effort resolution — complex expressions may not resolve.
-    """
+def _build_cte_column_map(parsed, cte_names, alias_to_table):
+    """Build (CTE_NAME, COLUMN) -> base_table map."""
     if not SQLGLOT_AVAILABLE:
         return {}
 
     cte_map = {}
-
     for cte in parsed.find_all(exp.CTE):
         cte_alias = cte.alias.upper() if cte.alias else None
         if not cte_alias:
             continue
 
-        # Get the CTE's SELECT body
         select = cte.this
         if not isinstance(select, exp.Select):
-            # Could be a UNION or subquery
             select = select.find(exp.Select)
             if not select:
                 continue
 
-        # Walk columns in the CTE's body
         for col in select.find_all(exp.Column):
             col_name = col.name.upper()
             table_ref = col.table.upper() if col.table else ""
@@ -413,18 +453,17 @@ def _build_cte_column_map(
                 full_name = f"{schema + '.' if schema else ''}{tname}"
                 cte_map[(cte_alias, col_name)] = full_name
             elif table_ref and table_ref in cte_names:
-                # CTE referencing another CTE — could recurse, but keep simple
                 cte_map[(cte_alias, col_name)] = f"CTE:{table_ref}"
 
     return cte_map
 
 
-def _deduplicate_columns(columns: list[dict]) -> list[dict]:
-    """Remove duplicate column entries."""
+def _deduplicate_columns(columns):
     seen = set()
     unique = []
     for c in columns:
-        key = (c["column"].upper(), c["table_ref"].upper(), c["resolved_base_table"].upper())
+        key = (c["column"].upper(), c["table_ref"].upper(),
+               c["resolved_base_table"].upper())
         if key not in seen:
             seen.add(key)
             unique.append(c)
@@ -435,26 +474,22 @@ def _deduplicate_columns(columns: list[dict]) -> list[dict]:
 # Phase 4: Output
 # ---------------------------------------------------------------------------
 
-def generate_report(analyses: list[QueryAnalysis], output_path: str):
-    """Write analysis results to a JSON file."""
+def generate_report(analyses, output_path):
     report = {
         "summary": {
             "total_blocks": len(analyses),
             "total_base_tables": len({
                 t["name"].upper()
-                for a in analyses
-                for t in a.base_tables
+                for a in analyses for t in a.base_tables
             }),
             "total_columns": len({
                 (c["column"].upper(), c["resolved_base_table"].upper())
-                for a in analyses
-                for c in a.columns
+                for a in analyses for c in a.columns
             }),
         },
         "all_base_tables": sorted({
             (t.get("schema", "") + "." if t.get("schema") else "") + t["name"]
-            for a in analyses
-            for t in a.base_tables
+            for a in analyses for t in a.base_tables
         }),
         "blocks": [asdict(a) for a in analyses],
     }
@@ -462,38 +497,115 @@ def generate_report(analyses: list[QueryAnalysis], output_path: str):
     with open(output_path, 'w') as f:
         json.dump(report, f, indent=2)
 
-    logger.info(f"Report written to {output_path}")
+    logger.info(f"JSON report written to {output_path}")
     return report
+
+
+def build_dataframe(analyses):
+    """
+    Build a DataFrame with one row per (base_table, column) pair.
+
+    Columns returned:
+    - block_index    : which EXECUTE IMMEDIATE block (1-based)
+    - base_table     : resolved base table name
+    - schema         : schema if known
+    - alias          : table alias used in query
+    - column         : column name
+    - table_ref      : original alias/table ref in SQL
+    - resolved_via   : 'direct' | 'cte' | 'unresolved'
+    """
+    records = _build_records(analyses)
+
+    if not PANDAS_AVAILABLE:
+        logger.warning("pandas not installed — returning list of dicts")
+        return records
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    df = df.sort_values(
+        ['block_index', 'base_table', 'column']
+    ).reset_index(drop=True)
+    return df
+
+
+def _build_records(analyses):
+    records = []
+
+    for analysis in analyses:
+        alias_map = {}
+        for t in analysis.base_tables:
+            alias_map[t['alias'].upper()] = t
+            alias_map[t['name'].upper()] = t
+
+        for col in analysis.columns:
+            resolved = col['resolved_base_table']
+            table_ref = col['table_ref']
+
+            if resolved.startswith('CTE:'):
+                resolved_via = 'cte'
+                base_table = resolved
+            elif resolved:
+                resolved_via = 'direct'
+                base_table = resolved
+            elif table_ref:
+                resolved_via = 'unresolved'
+                base_table = f'?:{table_ref}'
+            else:
+                resolved_via = 'unresolved'
+                base_table = '?'
+
+            schema = ''
+            alias = table_ref
+            for t in analysis.base_tables:
+                if t['name'].upper() in base_table.upper():
+                    schema = t.get('schema', '')
+                    alias = t.get('alias', table_ref)
+                    break
+
+            records.append({
+                'block_index': analysis.block_index,
+                'base_table': base_table,
+                'schema': schema,
+                'alias': alias,
+                'column': col['column'],
+                'table_ref': table_ref,
+                'resolved_via': resolved_via,
+            })
+
+    return records
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def analyze_file(input_path: str, output_path: str = "analysis_results.json") -> dict:
-    """Full pipeline: read file -> extract -> clean -> parse -> report."""
+def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
+    """
+    Full pipeline: read -> extract -> clean -> parse -> report.
+
+    Returns:
+        (report_dict, DataFrame)
+    """
     logger.info(f"Reading {input_path}")
     text = Path(input_path).read_text(encoding='utf-8', errors='replace')
 
-    # Phase 1: Extract
     raw_blocks = extract_execute_immediate_blocks(text)
 
     if not raw_blocks:
         logger.warning("No EXECUTE IMMEDIATE blocks found!")
-        # Fall back: maybe the file is just plain SQL?
-        logger.info("Attempting to parse the entire file as plain SQL...")
+        logger.info("Attempting to parse entire file as plain SQL...")
         raw_blocks = [text]
 
     analyses = []
     for i, raw_sql in enumerate(raw_blocks):
         logger.info(f"Processing block {i + 1}/{len(raw_blocks)}")
-        logger.debug(f"Raw extracted SQL:\n{raw_sql[:200]}...")
+        logger.debug(f"Extracted SQL (first 300 chars):\n{raw_sql[:300]}")
 
-        # Phase 2: Clean
         cleaned = clean_sql_for_parsing(raw_sql)
-        logger.debug(f"Cleaned SQL:\n{cleaned[:200]}...")
+        logger.debug(f"Cleaned SQL (first 300 chars):\n{cleaned[:300]}")
 
-        # Phase 3 & 4: Parse and extract
         analysis = analyze_sql(cleaned, block_index=i + 1)
         analyses.append(analysis)
 
@@ -501,24 +613,24 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json") ->
             for err in analysis.parse_errors:
                 logger.warning(f"  Block {i + 1}: {err}")
         else:
-            logger.info(f"  Block {i + 1}: {len(analysis.base_tables)} tables, "
+            logger.info(f"  Block {i + 1}: {len(analysis.base_tables)} base tables, "
                         f"{len(analysis.columns)} columns, "
                         f"{len(analysis.cte_names)} CTEs")
 
-    # Phase 5: Report
     report = generate_report(analyses, output_path)
+    df = build_dataframe(analyses)
 
-    # Print summary to console
     print(f"\n{'=' * 60}")
-    print(f"Analysis Summary")
+    print(f"  Analysis Complete")
     print(f"{'=' * 60}")
-    print(f"EXECUTE IMMEDIATE blocks found: {report['summary']['total_blocks']}")
-    print(f"Unique base tables: {report['summary']['total_base_tables']}")
-    print(f"Unique columns: {report['summary']['total_columns']}")
-    print(f"\nBase tables: {', '.join(report['all_base_tables'])}")
-    print(f"\nFull report: {output_path}")
+    print(f"  Blocks analyzed:    {report['summary']['total_blocks']}")
+    print(f"  Unique base tables: {report['summary']['total_base_tables']}")
+    print(f"  Unique columns:     {report['summary']['total_columns']}")
+    print(f"  Base tables: {', '.join(report['all_base_tables'])}")
+    print(f"  JSON report: {output_path}")
+    print(f"{'=' * 60}\n")
 
-    return report
+    return report, df
 
 
 if __name__ == "__main__":
@@ -527,7 +639,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("input", help="Path to the .sql file")
     parser.add_argument("--output", "-o", default="analysis_results.json",
-                        help="Output JSON file path (default: analysis_results.json)")
+                        help="Output JSON file (default: analysis_results.json)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug logging")
 
@@ -536,3 +648,13 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
 
     analyze_file(args.input, args.output)
+
+
+    '''
+    import logging
+    logging.getLogger().setLevel(logging.DEBUG)
+
+    report, df = oracle_sql_analyzer.analyze_file('test_aml_script.sql')
+
+    logging.getLogger().setLevel(logging.INFO)
+    '''
