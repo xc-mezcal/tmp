@@ -201,31 +201,21 @@ def _parse_declare_variables(plsql_text: str) -> set:
 def clean_direct_sql(raw_sql: str, plsql_variables: set) -> str:
     """
     Clean a direct SQL block (not from EXECUTE IMMEDIATE).
-    - Remove hints
-    - Remove comments
+    - Remove hints and comments (quote-aware)
     - Replace known PL/SQL variables with placeholder values
     - Normalize whitespace
     """
     sql = raw_sql.strip().rstrip(';').strip()
 
-    # Remove Oracle optimizer hints
-    sql = re.sub(r'/\*\+.*?\*/', '', sql, flags=re.DOTALL)
-
-    # Remove single-line comments
-    sql = re.sub(r'--[^\n]*', '', sql)
-
-    # Remove block comments
-    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+    # Quote-aware removal of hints and comments
+    sql = _strip_comments_and_hints(sql)
 
     # Replace PL/SQL variables with placeholders
-    # Only replace when they appear as standalone identifiers (not part of column/table names)
     for var in plsql_variables:
-        # Replace var when it's a standalone token (not preceded/followed by . or alphanumeric)
         pattern = r'(?<![A-Za-z0-9_.])\b' + re.escape(var) + r'\b(?![A-Za-z0-9_.])'
         sql = re.sub(pattern, '0', sql, flags=re.IGNORECASE)
 
-    # Also handle common PL/SQL assignment artifacts that might leak
-    # e.g., := which shouldn't be in SQL
+    # Remove PL/SQL assignment artifacts
     sql = re.sub(r':=\s*\S+', '', sql)
 
     # Normalize whitespace
@@ -386,19 +376,76 @@ def _expression_to_placeholder(expr: str) -> str:
 def clean_sql_for_parsing(raw_sql: str) -> str:
     sql = raw_sql.strip().rstrip(';').strip()
 
-    # Remove Oracle optimizer hints /*+ ... */
-    sql = re.sub(r'/\*\+.*?\*/', '', sql, flags=re.DOTALL)
-
-    # Remove single-line SQL comments
-    sql = re.sub(r'--[^\n]*', '', sql)
-
-    # Remove block comments (non-greedy)
-    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+    # Quote-aware removal of hints and comments
+    sql = _strip_comments_and_hints(sql)
 
     # Normalize whitespace
     sql = re.sub(r'\s+', ' ', sql).strip()
 
     return sql
+
+
+def _strip_comments_and_hints(sql: str) -> str:
+    """
+    Remove SQL comments (-- and /* */) and Oracle hints (/*+ ... */)
+    while respecting string literals. Content inside '...' is never touched.
+
+    Handles:
+    - '--' inside strings like nvl(x, '--') — preserved
+    - /*+ APPEND */ hints — removed
+    - /* block comments */ — removed
+    - -- line comments — removed
+    """
+    result = []
+    i = 0
+
+    while i < len(sql):
+        # Inside a single-quoted string — copy verbatim
+        if sql[i] == "'":
+            result.append("'")
+            i += 1
+            while i < len(sql):
+                if sql[i] == "'":
+                    if i + 1 < len(sql) and sql[i + 1] == "'":
+                        # Escaped quote ''
+                        result.append("''")
+                        i += 2
+                    else:
+                        # End of string
+                        result.append("'")
+                        i += 1
+                        break
+                else:
+                    result.append(sql[i])
+                    i += 1
+
+        # Block comment or hint: /* ... */ or /*+ ... */
+        elif sql[i] == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+            # Find the closing */
+            end = sql.find('*/', i + 2)
+            if end == -1:
+                # Unclosed comment — skip rest
+                break
+            else:
+                # Skip the entire comment/hint (replace with space to avoid token merging)
+                result.append(' ')
+                i = end + 2
+
+        # Single-line comment: --
+        elif sql[i] == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+            # Skip to end of line
+            end = sql.find('\n', i)
+            if end == -1:
+                break
+            else:
+                result.append(' ')
+                i = end + 1
+
+        else:
+            result.append(sql[i])
+            i += 1
+
+    return ''.join(result)
 
 
 # ===========================================================================
@@ -694,7 +741,13 @@ def _process_scope(scope, dag, scope_col_maps, block_index, scope_name):
 
 def _process_select_expr(sel_expr, source_info, scope, dag,
                           scope_col_maps, col_map, block_index, scope_name):
-    """Process one SELECT expression, populate col_map, add base leaf edges."""
+    """
+    Process one SELECT expression, populate col_map, add base leaf edges.
+
+    CRITICAL: We must NOT descend into subqueries (exp.Subquery, exp.Select).
+    Those are separate scopes handled by traverse_scope independently.
+    We only collect Column nodes that belong to THIS scope.
+    """
 
     # Handle * and t.*
     if isinstance(sel_expr, exp.Star):
@@ -713,17 +766,16 @@ def _process_select_expr(sel_expr, source_info, scope, dag,
     elif isinstance(sel_expr, exp.Column):
         output_name = sel_expr.name.upper()
     else:
-        col = sel_expr.find(exp.Column)
-        if col and not isinstance(col.this, exp.Star):
+        # For expressions like count(c) — find first Column NOT inside a subquery
+        col = _find_column_no_subquery(sel_expr)
+        if col:
             output_name = col.name.upper()
         else:
             return
 
-    # Resolve column references
+    # Resolve column references — only those in THIS scope (not in subqueries)
     sources = []
-    for col_node in sel_expr.find_all(exp.Column):
-        if isinstance(col_node.this, exp.Star):
-            continue
+    for col_node in _find_all_columns_no_subquery(sel_expr):
         col_name = col_node.name.upper()
         col_table_ref = col_node.table.upper() if col_node.table else ""
 
@@ -734,6 +786,37 @@ def _process_select_expr(sel_expr, source_info, scope, dag,
 
     if sources:
         col_map[output_name] = sources
+
+
+def _find_all_columns_no_subquery(node) -> list:
+    """
+    Find all exp.Column nodes under `node`, but do NOT descend into
+    exp.Subquery or exp.Select nodes (those are separate scopes).
+    """
+    columns = []
+    _walk_no_subquery(node, columns)
+    return columns
+
+
+def _walk_no_subquery(node, columns, depth=0):
+    """Recursive walk that stops at subquery boundaries."""
+    if isinstance(node, exp.Column):
+        if not isinstance(node.this, exp.Star):
+            columns.append(node)
+        return
+
+    # Stop at subquery boundaries (but allow the top-level node itself)
+    if depth > 0 and isinstance(node, (exp.Subquery, exp.Select)):
+        return
+
+    for child in node.iter_expressions():
+        _walk_no_subquery(child, columns, depth + 1)
+
+
+def _find_column_no_subquery(node):
+    """Find the first Column node without descending into subqueries."""
+    cols = _find_all_columns_no_subquery(node)
+    return cols[0] if cols else None
 
 
 def _expand_star(table_ref, source_info, scope, dag, scope_col_maps,
