@@ -90,6 +90,150 @@ def extract_execute_immediate_blocks(plsql_text: str) -> list[str]:
     return blocks
 
 
+def extract_direct_sql_blocks(plsql_text: str) -> list[str]:
+    """
+    Extract SQL statements written directly in PL/SQL (no EXECUTE IMMEDIATE).
+    Finds INSERT INTO (with optional hints), MERGE, DELETE FROM, UPDATE
+    at statement level (beginning of a line after whitespace).
+    """
+    text = plsql_text.replace('\r\n', '\n')
+    blocks = []
+
+    # Match DML at the beginning of a line (after optional whitespace)
+    # INSERT with optional hints: INSERT /*+ APPEND */ INTO
+    sql_start = re.compile(
+        r'^\s*(INSERT\s+(?:/\*.*?\*/\s*)?INTO\s|MERGE\s|DELETE\s+FROM\s|UPDATE\s)',
+        re.IGNORECASE | re.MULTILINE | re.DOTALL
+    )
+
+    for match in sql_start.finditer(text):
+        keyword_start = match.start(1)
+
+        # Skip if inside a comment
+        line_start = text.rfind('\n', 0, keyword_start) + 1
+        line_prefix = text[line_start:keyword_start]
+        if '--' in line_prefix:
+            continue
+
+        last_open = text.rfind('/*', 0, keyword_start)
+        last_close = text.rfind('*/', 0, keyword_start)
+        if last_open > last_close:
+            continue
+
+        sql_text = _extract_until_semicolon(text, keyword_start)
+        if sql_text and len(sql_text.strip()) > 10:
+            blocks.append(sql_text)
+
+    logger.info(f"Found {len(blocks)} direct SQL block(s)")
+    return blocks
+
+
+def _extract_until_semicolon(text: str, pos: int) -> Optional[str]:
+    """Extract text from pos until the next semicolon, respecting quotes and comments."""
+    i = pos
+    while i < len(text) and text[i] in ' \t\n\r':
+        i += 1
+
+    start = i
+    in_single_quote = False
+
+    while i < len(text):
+        ch = text[i]
+
+        if in_single_quote:
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2  # escaped quote
+                else:
+                    in_single_quote = False
+                    i += 1
+            else:
+                i += 1
+        elif ch == "'":
+            in_single_quote = True
+            i += 1
+        elif ch == '-' and i + 1 < len(text) and text[i + 1] == '-':
+            # Single-line comment — skip to end of line
+            i = text.find('\n', i)
+            if i == -1:
+                i = len(text)
+        elif ch == '/' and i + 1 < len(text) and text[i + 1] == '*':
+            # Block comment — skip to */
+            end = text.find('*/', i + 2)
+            i = end + 2 if end != -1 else len(text)
+        elif ch == ';':
+            return text[start:i].strip()
+        else:
+            i += 1
+
+    return text[start:].strip() if start < len(text) else None
+
+
+def _parse_declare_variables(plsql_text: str) -> set:
+    """
+    Extract variable names from the DECLARE section.
+    These are PL/SQL variables that appear inline in direct SQL.
+    """
+    variables = set()
+    text_upper = plsql_text.upper()
+
+    # Find DECLARE...BEGIN section
+    decl_start = text_upper.find('DECLARE')
+    begin_pos = text_upper.find('BEGIN', decl_start if decl_start >= 0 else 0)
+
+    if decl_start < 0 or begin_pos < 0:
+        return variables
+
+    decl_section = plsql_text[decl_start + 7:begin_pos]
+
+    # Match variable declarations: var_name TYPE [:= value];
+    var_pattern = re.compile(
+        r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s+(?:NUMBER|VARCHAR2|DATE|CHAR|INTEGER|BOOLEAN|TIMESTAMP)',
+        re.IGNORECASE | re.MULTILINE
+    )
+    for m in var_pattern.finditer(decl_section):
+        variables.add(m.group(1).upper())
+
+    logger.debug(f"  DECLARE variables found: {variables}")
+    return variables
+
+
+def clean_direct_sql(raw_sql: str, plsql_variables: set) -> str:
+    """
+    Clean a direct SQL block (not from EXECUTE IMMEDIATE).
+    - Remove hints
+    - Remove comments
+    - Replace known PL/SQL variables with placeholder values
+    - Normalize whitespace
+    """
+    sql = raw_sql.strip().rstrip(';').strip()
+
+    # Remove Oracle optimizer hints
+    sql = re.sub(r'/\*\+.*?\*/', '', sql, flags=re.DOTALL)
+
+    # Remove single-line comments
+    sql = re.sub(r'--[^\n]*', '', sql)
+
+    # Remove block comments
+    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+
+    # Replace PL/SQL variables with placeholders
+    # Only replace when they appear as standalone identifiers (not part of column/table names)
+    for var in plsql_variables:
+        # Replace var when it's a standalone token (not preceded/followed by . or alphanumeric)
+        pattern = r'(?<![A-Za-z0-9_.])\b' + re.escape(var) + r'\b(?![A-Za-z0-9_.])'
+        sql = re.sub(pattern, '0', sql, flags=re.IGNORECASE)
+
+    # Also handle common PL/SQL assignment artifacts that might leak
+    # e.g., := which shouldn't be in SQL
+    sql = re.sub(r':=\s*\S+', '', sql)
+
+    # Normalize whitespace
+    sql = re.sub(r'\s+', ' ', sql).strip()
+
+    return sql
+
+
 def _extract_exec_imm_statement(text: str, pos: int) -> Optional[str]:
     tokens = _tokenize_plsql_expr(text, pos)
     if not tokens:
@@ -879,17 +1023,37 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
     """
     Full pipeline. Returns (report_dict, df_columns, df_edges).
 
-    df_columns: flattened base table columns, derived from the DAG.
-    df_edges: the full lineage DAG edge table.
+    Handles two patterns:
+    1. EXECUTE IMMEDIATE '...' — SQL inside PL/SQL string literals
+    2. Direct SQL in PL/SQL — INSERT/SELECT/etc. written directly
+
+    Detects which pattern is used and extracts accordingly.
     """
     logger.info(f"Reading {input_path}")
     text = Path(input_path).read_text(encoding='utf-8', errors='replace')
 
+    # Try EXECUTE IMMEDIATE first
     raw_blocks = extract_execute_immediate_blocks(text)
+    extraction_mode = "execute_immediate"
+
     if not raw_blocks:
-        logger.warning("No EXECUTE IMMEDIATE blocks found!")
-        logger.info("Attempting to parse entire file as plain SQL...")
+        # No EXECUTE IMMEDIATE — try direct SQL extraction
+        logger.info("No EXECUTE IMMEDIATE found. Trying direct SQL extraction...")
+        raw_blocks = extract_direct_sql_blocks(text)
+        extraction_mode = "direct_sql"
+
+    if not raw_blocks:
+        # Last resort: treat entire file as plain SQL
+        logger.warning("No SQL blocks found! Attempting to parse entire file...")
         raw_blocks = [text]
+        extraction_mode = "raw"
+
+    logger.info(f"Extraction mode: {extraction_mode}, {len(raw_blocks)} block(s)")
+
+    # Parse DECLARE variables (needed for direct SQL mode)
+    plsql_variables = set()
+    if extraction_mode == "direct_sql":
+        plsql_variables = _parse_declare_variables(text)
 
     dag = LineageDAG()
     block_results = []
@@ -897,7 +1061,12 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
     for i, raw_sql in enumerate(raw_blocks):
         logger.info(f"Processing block {i + 1}/{len(raw_blocks)}")
 
-        cleaned = clean_sql_for_parsing(raw_sql)
+        # Clean based on extraction mode
+        if extraction_mode == "direct_sql":
+            cleaned = clean_direct_sql(raw_sql, plsql_variables)
+        else:
+            cleaned = clean_sql_for_parsing(raw_sql)
+
         logger.debug(f"  Cleaned (first 300): {cleaned[:300]}")
 
         res = process_block(cleaned, dag, block_index=i + 1)
@@ -919,7 +1088,7 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
     df_columns, df_edges = build_dataframe(dag)
 
     print(f"\n{'=' * 60}")
-    print(f"  Analysis Complete")
+    print(f"  Analysis Complete ({extraction_mode})")
     print(f"{'=' * 60}")
     print(f"  Blocks analyzed:    {len(block_results)}")
     print(f"  Base tables:        {dag.get_base_tables()}")
