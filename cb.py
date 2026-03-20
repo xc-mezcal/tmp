@@ -370,9 +370,9 @@ class LineageDAG:
         base_tables = set(self.get_base_tables())
         leaves = set()
         for e in self.edges:
-            if e["source_table"] and e["source_table"] in base_tables:
+            if e["source_table"] and e["source_table"] in base_tables and e["source_column"]:
                 leaves.add((e["source_table"], e["source_column"]))
-            if e["scope_type"] == "base" and e["output_table"]:
+            if e["scope_type"] == "base" and e["output_table"] and e["output_column"]:
                 leaves.add((e["output_table"], e["output_column"]))
         return sorted(leaves)
 
@@ -575,9 +575,9 @@ def _build_scope_col_map(scope, dag: LineageDAG, scope_col_maps: dict,
         if isinstance(source, exp.Table):
             tname = source.name.upper()
             source_info[alias_upper] = (tname, False, None)
-            # If not already known as derived, it's a base table
+            # If not already known as derived, note it's a base table
             if not dag.has_scope(tname):
-                dag.add_base(tname, "", block_index, scope_name)
+                pass  # Will be added as base when actual columns are resolved
         elif isinstance(source, Scope):
             source_info[alias_upper] = (alias_upper, True, source)
 
