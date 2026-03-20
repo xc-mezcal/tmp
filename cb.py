@@ -433,21 +433,47 @@ def process_block(cleaned_sql: str, registry: TableRegistry,
     if insert_target:
         registry.register_derived(insert_target, main_col_map)
 
-    # --- Flatten all columns to base tables ---
-    seen = set()
-    for col_name, sources in main_col_map.items():
-        for src_tbl, src_col in sources:
-            for base_tbl, base_col in registry.resolve(src_tbl, src_col):
-                pair = (base_tbl, base_col)
-                if pair not in seen:
-                    seen.add(pair)
-                    result["columns"].append({
-                        "base_table": base_tbl,
-                        "column": base_col,
-                    })
+    # --- Flatten columns with rich metadata ---
+    seen_pairs = set()
 
-    # Also collect columns from WHERE, JOIN ON, GROUP BY, etc.
-    _collect_non_select_columns(parsed, registry, result, seen)
+    # From the main SELECT's column map
+    for col_name, sources in main_col_map.items():
+        is_ambiguous = len(sources) > 1
+        for src_tbl, src_col in sources:
+            resolved_list = registry.resolve(src_tbl, src_col)
+            for base_tbl, base_col in resolved_list:
+                # Determine source_type: how did we get to this base table?
+                if src_tbl == base_tbl and registry.is_base(base_tbl):
+                    source_type = "direct"
+                elif registry.is_derived(src_tbl):
+                    # Check if src_tbl is a CTE or INSERT target
+                    if src_tbl in (result.get("ctes_found") or []):
+                        source_type = "cte"
+                    elif src_tbl == insert_target:
+                        source_type = "insert_target"
+                    else:
+                        # Could be CTE from this block or prior INSERT target
+                        source_type = "derived"
+                else:
+                    source_type = "direct"
+
+                record = {
+                    "base_table": base_tbl,
+                    "column": base_col,
+                    "source_type": source_type,
+                    "source_name": src_tbl,
+                    "output_name": col_name,
+                    "clause": "SELECT",
+                    "ambiguous": is_ambiguous,
+                }
+                pair_key = (base_tbl, base_col, "SELECT")
+                if pair_key not in seen_pairs:
+                    seen_pairs.add(pair_key)
+                    result["columns"].append(record)
+
+    # From WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY
+    _collect_non_select_columns(parsed, registry, result, seen_pairs,
+                                 result.get("ctes_found", []), insert_target)
 
     result["base_tables_found"] = sorted({
         c["base_table"] for c in result["columns"]
@@ -525,33 +551,77 @@ def _resolve_select_body(select_node, registry: TableRegistry
 
 def _build_scope(select_node, registry: TableRegistry) -> dict[str, str]:
     """
-    Build alias → actual_table_name map for a SELECT's FROM + JOINs.
-    Also registers unknown tables as base tables in the registry.
+    Build alias → actual_table_name map for a SELECT's FROM + JOINs ONLY.
+
+    CRITICAL: We must NOT include tables from WHERE subqueries, HAVING
+    subqueries, or SELECT-list subqueries. Those are separate scopes.
+
+    sqlglot tree structure for SELECT:
+      Select
+        ├── expressions  (SELECT list)
+        ├── From
+        │     └── Table / Subquery
+        ├── Join(s)
+        │     └── Table / Subquery
+        └── Where
+              └── (may contain Subquery with its own Tables — DO NOT include)
     """
     scope = {}  # ALIAS_UPPER -> TABLE_NAME_UPPER
 
-    # Walk all Table nodes that are direct children of this SELECT's FROM/JOIN
-    for table_node in select_node.find_all(exp.Table):
-        tname = table_node.name.upper()
-        talias = table_node.alias.upper() if table_node.alias else tname
+    # Get tables from FROM clause (direct children only, not nested subqueries)
+    from_node = select_node.find(exp.From)
+    if from_node:
+        _collect_scope_tables(from_node, scope, registry)
 
-        scope[talias] = tname
-
-        # Register in registry if unknown
-        if not registry.is_known(tname):
-            registry.register_base(tname)
-
-    # Handle subqueries in FROM (inline views)
-    for subq in select_node.find_all(exp.Subquery):
-        if subq.alias:
-            sub_alias = subq.alias.upper()
-            sub_select = subq.find(exp.Select)
-            if sub_select:
-                sub_map = _resolve_select_body(sub_select, registry)
-                registry.register_derived(sub_alias, sub_map)
-                scope[sub_alias] = sub_alias
+    # Get tables from JOIN clauses
+    for join_node in select_node.find_all(exp.Join):
+        # Only process JOINs that are direct children of this SELECT,
+        # not JOINs inside WHERE subqueries
+        if _is_direct_child_of(join_node, select_node):
+            _collect_scope_tables(join_node, scope, registry)
 
     return scope
+
+
+def _collect_scope_tables(node, scope: dict, registry: TableRegistry):
+    """
+    Collect Table nodes from a FROM or JOIN node.
+    Only collects DIRECT Table children — stops at Subquery boundaries
+    (those are inline views with their own scope).
+    """
+    for child in node.iter_expressions():
+        if isinstance(child, exp.Table):
+            tname = child.name.upper()
+            talias = child.alias.upper() if child.alias else tname
+            scope[talias] = tname
+            if not registry.is_known(tname):
+                registry.register_base(tname)
+        elif isinstance(child, exp.Subquery):
+            # Inline view (subquery in FROM with alias) — register as derived
+            if child.alias:
+                sub_alias = child.alias.upper()
+                sub_select = child.find(exp.Select)
+                if sub_select:
+                    sub_map = _resolve_select_body(sub_select, registry)
+                    registry.register_derived(sub_alias, sub_map)
+                    scope[sub_alias] = sub_alias
+            # Do NOT descend further — subquery tables are not in our scope
+        elif not isinstance(child, (exp.Select, exp.Where)):
+            # Recurse into non-scope-creating nodes (e.g., Paren, Lateral)
+            _collect_scope_tables(child, scope, registry)
+
+
+def _is_direct_child_of(node, ancestor) -> bool:
+    """Check if node is a direct descendant without crossing a scope boundary."""
+    parent = node.parent if hasattr(node, 'parent') else None
+    while parent:
+        if parent is ancestor:
+            return True
+        # Stop at scope boundaries
+        if isinstance(parent, (exp.Subquery, exp.CTE)):
+            return False
+        parent = parent.parent if hasattr(parent, 'parent') else None
+    return False
 
 
 def _get_output_name(sel_expr) -> Optional[str]:
@@ -656,10 +726,12 @@ def _resolve_one_column(col_name: str, col_table_ref: str,
 
 
 def _collect_non_select_columns(parsed, registry: TableRegistry,
-                                 block_result: dict, seen: set):
+                                 block_result: dict, seen: set,
+                                 cte_names: list, insert_target: Optional[str]):
     """
     Collect column references from WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY.
     These columns indicate base table usage even if not in the SELECT list.
+    Detects which clause each column comes from.
     """
     # Build global alias map from ALL Table nodes
     global_scope = {}
@@ -670,24 +742,69 @@ def _collect_non_select_columns(parsed, registry: TableRegistry,
         if not registry.is_known(tname):
             registry.register_base(tname)
 
-    # Walk ALL Column nodes
+    # Walk ALL Column nodes and determine their clause
     for col_node in parsed.find_all(exp.Column):
         col_name = col_node.name.upper()
         col_table_ref = col_node.table.upper() if col_node.table else ""
 
         if not col_table_ref:
-            continue  # Skip unqualified — already handled in SELECT resolution
+            continue
+
+        # Detect clause by walking up the parent chain
+        clause = _detect_clause(col_node)
 
         actual_table = global_scope.get(col_table_ref, col_table_ref)
 
         for base_tbl, base_col in registry.resolve(actual_table, col_name):
-            pair = (base_tbl, base_col)
-            if pair not in seen:
-                seen.add(pair)
+            pair_key = (base_tbl, base_col, clause)
+            if pair_key not in seen:
+                seen.add(pair_key)
+
+                # Determine source_type
+                if actual_table == base_tbl and registry.is_base(base_tbl):
+                    source_type = "direct"
+                elif actual_table in (cte_names or []):
+                    source_type = "cte"
+                elif actual_table == insert_target:
+                    source_type = "insert_target"
+                elif registry.is_derived(actual_table):
+                    source_type = "derived"
+                else:
+                    source_type = "direct"
+
                 block_result["columns"].append({
                     "base_table": base_tbl,
                     "column": base_col,
+                    "source_type": source_type,
+                    "source_name": actual_table,
+                    "output_name": col_name,
+                    "clause": clause,
+                    "ambiguous": False,
                 })
+
+
+def _detect_clause(col_node) -> str:
+    """Walk up the parse tree to determine which SQL clause a Column is in."""
+    if not SQLGLOT_AVAILABLE:
+        return "UNKNOWN"
+
+    node = col_node.parent if hasattr(col_node, 'parent') else None
+    while node:
+        if isinstance(node, exp.Where):
+            return "WHERE"
+        if isinstance(node, exp.Group):
+            return "GROUP_BY"
+        if isinstance(node, exp.Having):
+            return "HAVING"
+        if isinstance(node, exp.Order):
+            return "ORDER_BY"
+        if isinstance(node, exp.Join):
+            return "JOIN_ON"
+        if isinstance(node, exp.Select):
+            return "SELECT"
+        node = node.parent if hasattr(node, 'parent') else None
+
+    return "OTHER"
 
 
 # ===========================================================================
@@ -733,35 +850,42 @@ def generate_report(block_results: list[dict], registry: TableRegistry,
 
 def build_dataframe(block_results: list[dict], registry: TableRegistry):
     """
-    Build a DataFrame: one row per unique (base_table, column).
+    Build a rich DataFrame — one row per column reference.
 
     Columns:
-    - base_table     : the ultimate source base table
-    - column         : column name
-    - first_seen_in  : block_index where first encountered
-    - referenced_in  : list of block indices that reference this column
+    - block_index   : which EXECUTE IMMEDIATE block
+    - base_table    : ultimate source base table (after resolving CTEs/INSERT)
+    - column        : column name on the base table
+    - source_type   : 'direct' | 'cte' | 'insert_target' | 'derived'
+    - source_name   : immediate table/CTE the column was read from
+    - output_name   : column name as it appears in the SELECT output
+    - clause        : 'SELECT' | 'WHERE' | 'JOIN_ON' | 'GROUP_BY' | 'HAVING' | 'ORDER_BY'
+    - ambiguous     : True if column source couldn't be uniquely determined
+    - is_base       : True if base_table is a real base table (not CTE/temp)
+
+    Filtering examples in notebook:
+        df[df.is_base]                          # only base table columns
+        df[df.is_base & (df.clause == 'SELECT')]  # base columns in SELECT
+        df[df.ambiguous]                         # needs human review
+        df[df.source_type == 'cte']              # columns that went through CTEs
+        df.groupby('base_table')['column'].apply(set)  # columns per table
     """
-    col_info: dict[tuple[str, str], dict] = {}
+    records = []
 
     for br in block_results:
         for c in br["columns"]:
-            bt = c["base_table"]
-            col = c["column"]
-            if not registry.is_base(bt):
-                continue
-            key = (bt, col)
-            if key not in col_info:
-                col_info[key] = {
-                    "base_table": bt,
-                    "column": col,
-                    "first_seen_in": br["block_index"],
-                    "referenced_in": [],
-                }
-            col_info[key]["referenced_in"].append(br["block_index"])
-
-    records = list(col_info.values())
-    for r in records:
-        r["referenced_in"] = sorted(set(r["referenced_in"]))
+            record = {
+                "block_index": br["block_index"],
+                "base_table": c.get("base_table", ""),
+                "column": c.get("column", ""),
+                "source_type": c.get("source_type", "direct"),
+                "source_name": c.get("source_name", ""),
+                "output_name": c.get("output_name", ""),
+                "clause": c.get("clause", ""),
+                "ambiguous": c.get("ambiguous", False),
+                "is_base": registry.is_base(c.get("base_table", "")),
+            }
+            records.append(record)
 
     if not PANDAS_AVAILABLE:
         logger.warning("pandas not installed — returning list of dicts")
@@ -771,7 +895,9 @@ def build_dataframe(block_results: list[dict], registry: TableRegistry):
     if df.empty:
         return df
 
-    return df.sort_values(["base_table", "column"]).reset_index(drop=True)
+    return df.sort_values(
+        ["block_index", "base_table", "column", "clause"]
+    ).reset_index(drop=True)
 
 
 # ===========================================================================
