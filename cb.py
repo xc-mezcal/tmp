@@ -4,18 +4,14 @@ Oracle PL/SQL EXECUTE IMMEDIATE Analyzer
 Reads Oracle PL/SQL scripts, extracts SQL from EXECUTE IMMEDIATE strings,
 parses them via sqlglot, and reports base tables + columns used.
 
-Handles:
-- Multiple EXECUTE IMMEDIATE blocks per file
-- || concatenation at PL/SQL level (variable interpolation)
-- || concatenation inside SQL (Oracle string concat) — preserved correctly
-- Escaped quotes ('') inside string literals
-- SQL comments (-- and /* */) inside the query
-- Oracle hints (/*+ ... */)
-- REGEXP patterns with special characters
-- CTE (WITH ... AS) resolution back to base tables
-- INSERT INTO ... WITH ... SELECT patterns
-
-Output: JSON file + DataFrame for notebook use.
+Architecture:
+  Phase 1: Extract + reassemble SQL from EXECUTE IMMEDIATE (our code)
+  Phase 2: Minimal cleanup for sqlglot (hints, comments only — keep INSERT INTO)
+  Phase 3: Walk sqlglot parse tree sequentially, building a TableRegistry
+           - CTEs processed top-to-bottom within a block
+           - INSERT INTO targets registered so later blocks can resolve through them
+           - Alias resolution via sqlglot's Table.name / Table.alias
+  Phase 4: Flatten to (base_table, column) pairs via registry.resolve()
 
 Usage (CLI):
     python oracle_sql_analyzer.py <input.sql> [--output results.json]
@@ -23,7 +19,7 @@ Usage (CLI):
 Usage (notebook):
     from oracle_sql_analyzer import analyze_file
     report, df = analyze_file("my_script.sql")
-    df  # displays the DataFrame
+    df
 """
 
 import re
@@ -31,7 +27,6 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 try:
@@ -51,18 +46,13 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Phase 1: Extract EXECUTE IMMEDIATE strings from PL/SQL
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def extract_execute_immediate_blocks(plsql_text: str) -> list[str]:
     """
     Find all EXECUTE IMMEDIATE '...' blocks and return the reconstructed SQL.
-
-    Strategy:
-    ---------
-    The EXECUTE IMMEDIATE statement in PL/SQL builds a SQL string via:
-        EXECUTE IMMEDIATE '<sql_frag>' || plsql_expr || '<sql_frag>' ...
 
     At the PL/SQL OUTER level:
     - String literals are delimited by single quotes
@@ -81,13 +71,11 @@ def extract_execute_immediate_blocks(plsql_text: str) -> list[str]:
     pattern = re.compile(r"EXECUTE\s+IMMEDIATE\s*", re.IGNORECASE)
 
     for match in pattern.finditer(text):
-        # Skip if inside a single-line comment
         line_start = text.rfind('\n', 0, match.start()) + 1
         line_prefix = text[line_start:match.start()]
         if '--' in line_prefix:
             continue
 
-        # Skip if inside a block comment
         last_open = text.rfind('/*', 0, match.start())
         last_close = text.rfind('*/', 0, match.start())
         if last_open > last_close:
@@ -103,15 +91,7 @@ def extract_execute_immediate_blocks(plsql_text: str) -> list[str]:
 
 
 def _extract_exec_imm_statement(text: str, pos: int) -> Optional[str]:
-    """
-    Parse the full EXECUTE IMMEDIATE statement starting at pos.
-
-    Tokenizes at the PL/SQL level into STRING / CONCAT / EXPR / END,
-    then reassembles: string content kept as SQL, expressions replaced
-    with placeholders.
-    """
     tokens = _tokenize_plsql_expr(text, pos)
-
     if not tokens:
         return None
 
@@ -128,9 +108,6 @@ def _extract_exec_imm_statement(text: str, pos: int) -> Optional[str]:
 
 
 def _tokenize_plsql_expr(text: str, pos: int) -> list[tuple[str, str]]:
-    """
-    Tokenize the RHS of EXECUTE IMMEDIATE into typed tokens.
-    """
     tokens = []
     i = _skip_ws(text, pos)
 
@@ -146,15 +123,12 @@ def _tokenize_plsql_expr(text: str, pos: int) -> list[tuple[str, str]]:
                 i = end_pos
             else:
                 break
-
         elif text[i] == '|' and i + 1 < len(text) and text[i + 1] == '|':
             tokens.append(('CONCAT', '||'))
             i += 2
-
         elif text[i] == ';':
             tokens.append(('END', ';'))
             break
-
         else:
             expr, end_pos = _parse_plsql_interp_expr(text, i)
             if expr:
@@ -171,11 +145,6 @@ def _skip_ws(text: str, pos: int) -> int:
 
 
 def _parse_plsql_string(text: str, pos: int) -> tuple[Optional[str], int]:
-    """
-    Parse a PL/SQL string literal starting at pos (must be ').
-    '' inside becomes ' (PL/SQL escape rule).
-    Everything else is raw SQL content — preserved verbatim.
-    """
     if pos >= len(text) or text[pos] != "'":
         return None, pos
 
@@ -197,16 +166,11 @@ def _parse_plsql_string(text: str, pos: int) -> tuple[Optional[str], int]:
 
 
 def _parse_plsql_interp_expr(text: str, pos: int) -> tuple[str, int]:
-    """
-    Parse a PL/SQL interpolated expression between || operators.
-    Respects parentheses and string literals inside function calls.
-    """
     i = pos
     paren_depth = 0
 
     while i < len(text):
         ch = text[i]
-
         if ch == '(':
             paren_depth += 1
             i += 1
@@ -241,11 +205,6 @@ def _parse_plsql_interp_expr(text: str, pos: int) -> tuple[str, int]:
 
 
 def _expression_to_placeholder(expr: str) -> str:
-    """
-    Convert a PL/SQL interpolated expression into a SQL-safe placeholder.
-    Returns a bare value (no wrapping quotes) — the surrounding SQL string
-    fragments provide whatever quoting context is needed.
-    """
     expr_upper = expr.upper().strip()
 
     if 'TO_CHAR' in expr_upper:
@@ -253,7 +212,6 @@ def _expression_to_placeholder(expr: str) -> str:
     if 'TO_DATE' in expr_upper:
         return '01-JAN-25'
 
-    # Functions that return numbers
     if any(fn in expr_upper for fn in [
         'LENGTH', 'REGEXP', 'NVL', 'COALESCE', 'DECODE',
         'GREATEST', 'LEAST', 'ABS', 'ROUND', 'TRUNC',
@@ -261,7 +219,6 @@ def _expression_to_placeholder(expr: str) -> str:
     ]):
         return '0'
 
-    # Numeric variable heuristic
     numeric_hints = [
         'AMT', 'NUM', 'COUNT', 'ID', 'LIMIT', 'MIN', 'MAX',
         'THRESHOLD', 'DAYS', 'FREQ', 'PERIOD', 'IND', 'AMOUNT',
@@ -270,41 +227,23 @@ def _expression_to_placeholder(expr: str) -> str:
     if any(hint in expr_upper for hint in numeric_hints):
         return '0'
 
-    # Simple identifier — default numeric
     if '(' not in expr and re.match(r'^[A-Za-z_][A-Za-z0-9_.]*$', expr.strip()):
         return '0'
 
     return 'PLACEHOLDER'
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: Clean up the extracted SQL for parsing
-# ---------------------------------------------------------------------------
-
-def _detect_insert_target(raw_sql: str) -> Optional[str]:
-    """Extract the INSERT INTO target table name (if present)."""
-    m = re.match(r'(?i)^\s*INSERT\s+INTO\s+(\S+)', raw_sql.strip())
-    return m.group(1) if m else None
-
+# ===========================================================================
+# Phase 2: Minimal cleanup for sqlglot
+# ===========================================================================
+# We keep INSERT INTO (sqlglot parses it fine and we need the target table).
+# We only remove things sqlglot can't handle: hints, comments.
 
 def clean_sql_for_parsing(raw_sql: str) -> str:
-    """
-    Clean extracted SQL for sqlglot parsing.
-    - Strip INSERT INTO <table> before WITH/SELECT (for parseability)
-    - Remove Oracle hints /*+ ... */
-    - Remove SQL comments
-    - Normalize whitespace
-    """
     sql = raw_sql.strip().rstrip(';').strip()
 
-    # Strip INSERT INTO <table> (with optional column list)
-    sql = re.sub(
-        r'(?i)^\s*INSERT\s+INTO\s+\S+\s*(\([^)]*\))?\s*(?=WITH\b|SELECT\b)',
-        '', sql
-    ).strip()
-
     # Remove Oracle optimizer hints /*+ ... */
-    sql = re.sub(r'/\*\+[^*]*?\*/', '', sql)
+    sql = re.sub(r'/\*\+.*?\*/', '', sql, flags=re.DOTALL)
 
     # Remove single-line SQL comments
     sql = re.sub(r'--[^\n]*', '', sql)
@@ -318,400 +257,512 @@ def clean_sql_for_parsing(raw_sql: str) -> str:
     return sql
 
 
-# ---------------------------------------------------------------------------
-# Phase 3: Parse with sqlglot — let it do the heavy lifting
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase 3: Table Registry — sequential, incremental resolution
+# ===========================================================================
 #
-# Architecture:
-#   sqlglot parses the SQL and gives us the AST.
-#   We use sqlglot's scope analysis where possible for alias resolution.
-#   We build our own lineage graph on top for:
-#     - CTE chain resolution (CTE_B -> CTE_A -> base_table)
-#     - Cross-block INSERT INTO tracking
-#     - Final flattening to (base_table, column) leaf nodes
+# Core idea: process the query top-to-bottom. Every time we encounter a
+# table reference, we check the registry:
+#   - Known derived table (CTE / INSERT target) → trace columns through it
+#   - Unknown → it's a base table, register it
 #
-# The lineage graph:
-#   Nodes are (table_name_upper, column_name_upper)
-#   Edges point from derived -> source
-#   Base tables are leaf nodes (no outgoing edges)
-#   CTEs and INSERT INTO targets are intermediate nodes
-# ---------------------------------------------------------------------------
+# Each derived table entry stores a column map:
+#   { COLUMN_NAME: [(source_table, source_column), ...] }
+#
+# The list allows for ambiguity (unqualified column in multi-table join).
 
-@dataclass
-class BlockInfo:
-    """Raw parsed info from a single EXECUTE IMMEDIATE block."""
-    block_index: int
-    raw_sql: str
-    cleaned_sql: str
-    insert_target: Optional[str]          # e.g., 'temp_alert_staging'
-    cte_definitions: dict                  # CTE_NAME -> {select_columns, source_tables}
-    base_tables: dict                      # TABLE_NAME -> {schema, aliases}
-    alias_to_table: dict                   # alias -> TABLE_NAME (base tables + CTEs)
-    select_columns: list[dict]             # [{column, table_ref, in_cte}]
-    parse_errors: list[str] = field(default_factory=list)
-
-
-def parse_block(cleaned_sql: str, raw_sql: str, block_index: int,
-                insert_target: Optional[str]) -> BlockInfo:
+class TableRegistry:
     """
-    Use sqlglot to parse a single SQL block and extract structured info.
-    """
-    info = BlockInfo(
-        block_index=block_index,
-        raw_sql=raw_sql,
-        cleaned_sql=cleaned_sql,
-        insert_target=insert_target.upper() if insert_target else None,
-        cte_definitions={},
-        base_tables={},
-        alias_to_table={},
-        select_columns=[],
-    )
-
-    if not SQLGLOT_AVAILABLE:
-        info.parse_errors.append("sqlglot not installed — pip install sqlglot")
-        return info
-
-    # --- Parse ---
-    try:
-        parsed = sqlglot.parse_one(cleaned_sql, read="oracle")
-    except Exception as e:
-        info.parse_errors.append(f"sqlglot parse error: {e}")
-        logger.warning(f"Block {block_index}: parse error — {e}")
-        try:
-            parsed = sqlglot.parse_one(
-                cleaned_sql, read="oracle",
-                error_level=sqlglot.ErrorLevel.WARN
-            )
-        except Exception as e2:
-            info.parse_errors.append(f"Lenient parse also failed: {e2}")
-            return info
-
-    # --- Collect CTE names first (needed to distinguish from base tables) ---
-    cte_names = set()
-    for cte_node in parsed.find_all(exp.CTE):
-        cname = cte_node.alias
-        if cname:
-            cte_names.add(cname.upper())
-
-    # --- Walk all Table nodes: build alias map and base table set ---
-    for table_node in parsed.find_all(exp.Table):
-        tname = table_node.name
-        tname_upper = tname.upper()
-        schema = table_node.db if hasattr(table_node, 'db') and table_node.db else ""
-        alias = table_node.alias if table_node.alias else tname
-
-        # Register in alias map (alias -> what it refers to)
-        info.alias_to_table[alias.upper()] = tname_upper
-
-        if tname_upper in cte_names:
-            # CTE reference, not a base table — alias still maps to CTE name
-            continue
-
-        # It's a base table (or temp table from a previous block — resolved later)
-        if tname_upper not in info.base_tables:
-            info.base_tables[tname_upper] = {
-                "name": tname,
-                "schema": schema,
-                "aliases": set(),
-            }
-        info.base_tables[tname_upper]["aliases"].add(alias.upper())
-
-    # --- Parse CTE definitions: what columns each CTE exposes ---
-    for cte_node in parsed.find_all(exp.CTE):
-        cte_alias = cte_node.alias
-        if not cte_alias:
-            continue
-        cte_name = cte_alias.upper()
-
-        cte_body = cte_node.this
-        cte_info = {"columns": {}, "source_tables": set()}
-
-        # Find all tables referenced in this CTE's body
-        for t in cte_body.find_all(exp.Table):
-            ref_name = t.name.upper()
-            ref_alias = t.alias.upper() if t.alias else ref_name
-            cte_info["source_tables"].add(ref_name)
-            # Also register local alias within CTE scope
-            info.alias_to_table[ref_alias] = ref_name
-
-        # Find all columns in the CTE's body and record their source table ref
-        for col in cte_body.find_all(exp.Column):
-            col_name = col.name.upper()
-            col_table_ref = col.table.upper() if col.table else ""
-
-            # Resolve the table ref through alias map
-            resolved_ref = info.alias_to_table.get(col_table_ref, col_table_ref)
-
-            # Store: this CTE column came from this source
-            # (could be base table or another CTE)
-            if col_name not in cte_info["columns"]:
-                cte_info["columns"][col_name] = resolved_ref
-
-        info.cte_definitions[cte_name] = cte_info
-
-    # --- Collect all Column references in the full query ---
-    for col in parsed.find_all(exp.Column):
-        col_name = col.name.upper()
-        col_table_ref = col.table.upper() if col.table else ""
-
-        # Resolve alias -> actual table/CTE name
-        resolved_ref = info.alias_to_table.get(col_table_ref, col_table_ref)
-
-        # Determine if this column is inside a CTE definition or in the main query
-        # (by checking parent chain for CTE nodes)
-        in_cte = None
-        parent = col.parent
-        while parent:
-            if isinstance(parent, exp.CTE):
-                in_cte = parent.alias.upper() if parent.alias else None
-                break
-            parent = parent.parent if hasattr(parent, 'parent') else None
-
-        info.select_columns.append({
-            "column": col_name,
-            "table_ref_raw": col.table.upper() if col.table else "",
-            "table_ref_resolved": resolved_ref,
-            "in_cte": in_cte,
-        })
-
-    return info
-
-
-# ---------------------------------------------------------------------------
-# Phase 3b: Lineage graph — cross-CTE and cross-block resolution
-# ---------------------------------------------------------------------------
-
-class LineageGraph:
-    """
-    Tracks column lineage across CTEs and EXECUTE IMMEDIATE blocks.
-
-    Nodes: (TABLE_NAME, COLUMN_NAME) tuples
-    Edges: derived_node -> source_node
-
-    After building, we can walk any node to its leaf (base table) source.
-
-    Also tracks INSERT INTO: if block 1 does INSERT INTO temp SELECT col FROM base,
-    then temp.col -> base.col, so block 2 reading temp.col resolves to base.col.
+    Incrementally built catalog of all tables and their column lineage.
+    Shared across all EXECUTE IMMEDIATE blocks in a file.
     """
 
     def __init__(self):
-        # edges[derived] = source  (single parent lineage, last-write-wins)
-        self.edges: dict[tuple[str, str], tuple[str, str]] = {}
-        # Known base tables (leaf nodes — not CTEs, not INSERT targets)
-        self.base_tables: set[str] = set()
-        # INSERT INTO targets: target_table -> {col -> (source_table, col)}
-        self.insert_targets: dict[str, dict[str, tuple[str, str]]] = {}
-        # All table metadata
-        self.table_meta: dict[str, dict] = {}  # TABLE -> {schema, aliases}
+        # table_name_upper -> {type: "base"|"derived", columns: {col -> [(src_tbl, src_col)]}}
+        self._tables: dict[str, dict] = {}
 
-    def add_block(self, info: BlockInfo):
-        """Integrate one parsed block into the lineage graph."""
+    def register_base(self, name: str):
+        key = name.upper()
+        if key not in self._tables:
+            self._tables[key] = {"type": "base", "columns": {}}
+            logger.debug(f"    Registry: base table [{key}]")
 
-        # Register base tables
-        for tname, meta in info.base_tables.items():
-            self.base_tables.add(tname)
-            if tname not in self.table_meta:
-                self.table_meta[tname] = {
-                    "schema": meta["schema"],
-                    "aliases": meta["aliases"].copy(),
-                }
-            else:
-                self.table_meta[tname]["aliases"].update(meta["aliases"])
+    def register_derived(self, name: str, column_map: dict[str, list[tuple[str, str]]]):
+        key = name.upper()
+        # If previously registered as base (appeared in an earlier block before
+        # we saw the INSERT INTO that creates it), upgrade to derived
+        self._tables[key] = {"type": "derived", "columns": column_map}
+        logger.debug(f"    Registry: derived table [{key}] — {len(column_map)} columns")
 
-        # Build CTE lineage edges
-        for cte_name, cte_info in info.cte_definitions.items():
-            for col_name, source_table in cte_info["columns"].items():
-                derived = (cte_name, col_name)
-                source = (source_table, col_name)
-                self.edges[derived] = source
+    def is_known(self, name: str) -> bool:
+        return name.upper() in self._tables
 
-        # Handle INSERT INTO: record that target_table.col -> source
-        if info.insert_target:
-            target = info.insert_target
-            logger.debug(f"  Block {info.block_index}: INSERT INTO {target}")
+    def is_base(self, name: str) -> bool:
+        entry = self._tables.get(name.upper())
+        return entry is not None and entry["type"] == "base"
 
-            # Remove from base_tables if it was previously added
-            # (it's a derived table, not a true base)
-            self.base_tables.discard(target)
+    def is_derived(self, name: str) -> bool:
+        entry = self._tables.get(name.upper())
+        return entry is not None and entry["type"] == "derived"
 
-            # Build column mapping: for columns in the main SELECT (not in CTEs),
-            # trace each back to its source
-            if target not in self.insert_targets:
-                self.insert_targets[target] = {}
+    def get_derived_columns(self, name: str) -> dict:
+        entry = self._tables.get(name.upper(), {})
+        return entry.get("columns", {})
 
-            for col_info in info.select_columns:
-                if col_info["in_cte"] is not None:
-                    continue  # Skip columns inside CTE definitions
+    def get_base_tables(self) -> list[str]:
+        return sorted(k for k, v in self._tables.items() if v["type"] == "base")
 
-                col_name = col_info["column"]
-                source_ref = col_info["table_ref_resolved"]
-
-                if source_ref:
-                    self.insert_targets[target][col_name] = (source_ref, col_name)
-                    # Also add an edge so resolve_to_base can follow it
-                    self.edges[(target, col_name)] = (source_ref, col_name)
-
-    def resolve_to_base(self, table: str, column: str,
-                        _visited: set = None) -> tuple[str, str]:
+    def resolve(self, table: str, column: str,
+                _visited: Optional[set] = None) -> list[tuple[str, str]]:
         """
-        Follow lineage edges until we reach a base table (leaf node).
-        Returns (base_table, column).
+        Resolve (table, column) to base table source(s).
+        Returns list of (base_table, base_column) — usually length 1,
+        >1 for ambiguous cases.
         """
         if _visited is None:
             _visited = set()
 
         key = (table.upper(), column.upper())
         if key in _visited:
-            logger.debug(f"  Cycle detected at {key}")
-            return key  # Cycle — return as-is
+            return [key]
         _visited.add(key)
 
-        # If it's already a base table, we're done
-        if table.upper() in self.base_tables:
-            return (table.upper(), column.upper())
+        entry = self._tables.get(table.upper())
 
-        # Check INSERT INTO targets
-        if table.upper() in self.insert_targets:
-            mapping = self.insert_targets[table.upper()]
-            if column.upper() in mapping:
-                src_table, src_col = mapping[column.upper()]
-                return self.resolve_to_base(src_table, src_col, _visited)
+        if entry is None:
+            # Unknown table — assume base
+            self.register_base(table)
+            return [(table.upper(), column.upper())]
 
-        # Check lineage edges (CTE chains)
-        if key in self.edges:
-            src_table, src_col = self.edges[key]
-            return self.resolve_to_base(src_table, src_col, _visited)
+        if entry["type"] == "base":
+            return [(table.upper(), column.upper())]
 
-        # Couldn't resolve — return as-is
-        return key
+        # Derived: look up this column in the column map
+        sources = entry["columns"].get(column.upper())
+        if not sources:
+            # Column not tracked (might be SELECT *, computed, or ROWNUM etc.)
+            # Return as-is — we can't trace further
+            return [(table.upper(), column.upper())]
 
-    def is_base_table(self, table: str) -> bool:
-        return table.upper() in self.base_tables
+        # Recursively resolve each source
+        results = []
+        for src_tbl, src_col in sources:
+            resolved = self.resolve(src_tbl, src_col, _visited.copy())
+            results.extend(resolved)
+
+        return results if results else [key]
 
 
-# ---------------------------------------------------------------------------
-# Phase 4: Flatten to final (base_table, column) pairs + output
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase 3b: Walk the sqlglot parse tree using the registry
+# ===========================================================================
 
-def build_final_results(blocks: list[BlockInfo], lineage: LineageGraph):
+def process_block(cleaned_sql: str, registry: TableRegistry,
+                  block_index: int) -> dict:
     """
-    Walk all column references, resolve each to a base table via lineage,
-    and produce the final deduplicated (base_table, column) records.
+    Parse one cleaned SQL block with sqlglot. Walk the tree sequentially:
+    1. Process CTEs in order (each builds on previous)
+    2. Process the main SELECT
+    3. If INSERT INTO, register the target as a derived table
+
+    Returns block-level result dict.
     """
-    records = []
-    seen = set()
+    result = {
+        "block_index": block_index,
+        "cleaned_sql": cleaned_sql,
+        "insert_target": None,
+        "ctes_found": [],
+        "base_tables_found": [],
+        "columns": [],
+        "parse_errors": [],
+    }
 
-    for info in blocks:
-        for col_info in info.select_columns:
-            col_name = col_info["column"]
-            raw_ref = col_info["table_ref_raw"]
-            resolved_ref = col_info["table_ref_resolved"]
+    if not SQLGLOT_AVAILABLE:
+        result["parse_errors"].append("sqlglot not installed — pip install sqlglot")
+        return result
 
-            # Skip if no table context at all
-            source = resolved_ref if resolved_ref else raw_ref
-            if not source:
-                # Column with no table qualifier — can't resolve
-                key = ("?", col_name.upper())
-                if key not in seen:
-                    seen.add(key)
-                    records.append({
-                        "block_index": info.block_index,
-                        "base_table": "UNRESOLVED",
-                        "schema": "",
-                        "column": col_name,
-                        "original_ref": raw_ref,
-                        "resolved_via": "unresolved",
-                    })
+    # --- Parse ---
+    try:
+        parsed = sqlglot.parse_one(cleaned_sql, read="oracle")
+    except Exception as e:
+        result["parse_errors"].append(f"Parse error: {e}")
+        logger.warning(f"Block {block_index}: parse error — {e}")
+        try:
+            parsed = sqlglot.parse_one(
+                cleaned_sql, read="oracle",
+                error_level=sqlglot.ErrorLevel.WARN,
+            )
+        except Exception as e2:
+            result["parse_errors"].append(f"Lenient parse also failed: {e2}")
+            return result
+
+    # --- Detect INSERT INTO target ---
+    insert_target = None
+    insert_node = parsed.find(exp.Insert)
+    if insert_node:
+        target_table = insert_node.find(exp.Table)
+        if target_table:
+            insert_target = target_table.name.upper()
+            result["insert_target"] = insert_target
+            logger.debug(f"  INSERT INTO {insert_target}")
+
+    # --- Process CTEs sequentially ---
+    with_node = parsed.find(exp.With)
+    if with_node:
+        for cte_node in with_node.find_all(exp.CTE):
+            cte_name = cte_node.alias
+            if not cte_name:
                 continue
+            cte_name_upper = cte_name.upper()
+            result["ctes_found"].append(cte_name_upper)
 
-            # Resolve through lineage graph to base table
-            base_table, base_col = lineage.resolve_to_base(source, col_name)
+            cte_body = cte_node.this  # The SELECT inside the CTE
+            col_map = _resolve_select_body(cte_body, registry)
+            registry.register_derived(cte_name_upper, col_map)
+            logger.debug(f"  CTE [{cte_name_upper}]: {list(col_map.keys())}")
 
-            # Determine resolution path
-            if lineage.is_base_table(base_table):
-                resolved_via = "direct"
-                if source != base_table:
-                    # It went through a CTE or INSERT INTO
-                    resolved_via = "cte" if source in {
-                        cte for b in blocks for cte in b.cte_definitions
-                    } else "insert_into"
-            else:
-                resolved_via = "unresolved"
+    # --- Process the main/final SELECT ---
+    main_select = _find_main_select(parsed)
+    if main_select is None:
+        result["parse_errors"].append("No main SELECT found")
+        return result
 
-            meta = lineage.table_meta.get(base_table, {})
-            schema = meta.get("schema", "")
+    main_col_map = _resolve_select_body(main_select, registry)
 
-            key = (base_table, base_col)
-            if key not in seen:
-                seen.add(key)
-                records.append({
-                    "block_index": info.block_index,
-                    "base_table": base_table,
-                    "schema": schema,
+    # --- If INSERT INTO, register target as derived ---
+    if insert_target:
+        registry.register_derived(insert_target, main_col_map)
+
+    # --- Flatten all columns to base tables ---
+    seen = set()
+    for col_name, sources in main_col_map.items():
+        for src_tbl, src_col in sources:
+            for base_tbl, base_col in registry.resolve(src_tbl, src_col):
+                pair = (base_tbl, base_col)
+                if pair not in seen:
+                    seen.add(pair)
+                    result["columns"].append({
+                        "base_table": base_tbl,
+                        "column": base_col,
+                    })
+
+    # Also collect columns from WHERE, JOIN ON, GROUP BY, etc.
+    _collect_non_select_columns(parsed, registry, result, seen)
+
+    result["base_tables_found"] = sorted({
+        c["base_table"] for c in result["columns"]
+        if registry.is_base(c["base_table"])
+    })
+
+    return result
+
+
+def _find_main_select(parsed) -> Optional[object]:
+    """
+    Find the 'main' SELECT — the outermost one that isn't inside a CTE.
+    For INSERT INTO ... WITH ... SELECT, this is the SELECT after all CTEs.
+    """
+    if not SQLGLOT_AVAILABLE:
+        return None
+
+    # For a plain SELECT or WITH...SELECT, the parsed root may be the Select
+    if isinstance(parsed, exp.Select):
+        return parsed
+
+    # For INSERT INTO ... SELECT, find the Select under Insert
+    insert = parsed.find(exp.Insert)
+    if insert:
+        # The SELECT is the expression part of the insert
+        select = insert.find(exp.Select)
+        if select:
+            return select
+
+    # Fallback: find any Select
+    return parsed.find(exp.Select)
+
+
+def _resolve_select_body(select_node, registry: TableRegistry
+                         ) -> dict[str, list[tuple[str, str]]]:
+    """
+    Given a SELECT node, resolve each column to its source table.
+
+    Steps:
+    1. Build scope: FROM + JOINs → alias_map {ALIAS: ACTUAL_TABLE}
+    2. For each referenced column:
+       - Qualified (t.col) → look up alias → (actual_table, col)
+       - Unqualified (col) → search all tables in scope
+         → if derived table has this column → that table
+         → if only base tables → ambiguous, list all
+    3. Track output names (aliases) for the column map
+
+    Returns: {OUTPUT_COL_NAME: [(source_table, source_col), ...]}
+    """
+    # Step 1: Build scope
+    scope = _build_scope(select_node, registry)
+    logger.debug(f"    Scope: {scope}")
+
+    # Step 2: Walk columns
+    column_map: dict[str, list[tuple[str, str]]] = {}
+
+    # Get the SELECT expressions (the projection list)
+    select_expressions = select_node.expressions if hasattr(select_node, 'expressions') else []
+
+    for sel_expr in select_expressions:
+        # Determine output name
+        output_name = _get_output_name(sel_expr)
+        if not output_name:
+            continue
+
+        # Find column references in this expression
+        sources = _extract_column_sources(sel_expr, scope, registry)
+
+        if sources:
+            column_map[output_name] = sources
+        # If no sources found (e.g., literal "0 AS SCENARIO_ID"), skip
+
+    return column_map
+
+
+def _build_scope(select_node, registry: TableRegistry) -> dict[str, str]:
+    """
+    Build alias → actual_table_name map for a SELECT's FROM + JOINs.
+    Also registers unknown tables as base tables in the registry.
+    """
+    scope = {}  # ALIAS_UPPER -> TABLE_NAME_UPPER
+
+    # Walk all Table nodes that are direct children of this SELECT's FROM/JOIN
+    for table_node in select_node.find_all(exp.Table):
+        tname = table_node.name.upper()
+        talias = table_node.alias.upper() if table_node.alias else tname
+
+        scope[talias] = tname
+
+        # Register in registry if unknown
+        if not registry.is_known(tname):
+            registry.register_base(tname)
+
+    # Handle subqueries in FROM (inline views)
+    for subq in select_node.find_all(exp.Subquery):
+        if subq.alias:
+            sub_alias = subq.alias.upper()
+            sub_select = subq.find(exp.Select)
+            if sub_select:
+                sub_map = _resolve_select_body(sub_select, registry)
+                registry.register_derived(sub_alias, sub_map)
+                scope[sub_alias] = sub_alias
+
+    return scope
+
+
+def _get_output_name(sel_expr) -> Optional[str]:
+    """
+    Get the output column name for a SELECT expression.
+    Could be: explicit alias (AS name), or the column name itself.
+    """
+    if not SQLGLOT_AVAILABLE:
+        return None
+
+    # If it's an Alias node: SELECT col AS alias_name
+    if isinstance(sel_expr, exp.Alias):
+        return sel_expr.alias.upper()
+
+    # If it's a Column node: SELECT t.col
+    if isinstance(sel_expr, exp.Column):
+        return sel_expr.name.upper()
+
+    # If it's a Star: SELECT * or SELECT t.*
+    if isinstance(sel_expr, exp.Star):
+        return None  # Can't track individual columns from *
+
+    # For expressions (functions, etc.), try to find a Column inside
+    col = sel_expr.find(exp.Column)
+    if col:
+        return col.name.upper()
+
+    return None
+
+
+def _extract_column_sources(expr_node, scope: dict,
+                             registry: TableRegistry
+                             ) -> list[tuple[str, str]]:
+    """
+    Find all Column references in an expression and resolve each
+    to (actual_table, column_name) using the scope.
+
+    For a simple "t.col", returns [(actual_table, col)].
+    For a complex expression like "t.col1 + s.col2", returns both.
+    For unqualified "col", searches all tables in scope.
+    """
+    if not SQLGLOT_AVAILABLE:
+        return []
+
+    sources = []
+
+    for col_node in expr_node.find_all(exp.Column):
+        col_name = col_node.name.upper()
+        col_table_ref = col_node.table.upper() if col_node.table else ""
+
+        resolved = _resolve_one_column(col_name, col_table_ref, scope, registry)
+        sources.extend(resolved)
+
+    return sources
+
+
+def _resolve_one_column(col_name: str, col_table_ref: str,
+                         scope: dict, registry: TableRegistry
+                         ) -> list[tuple[str, str]]:
+    """
+    Resolve a single column reference.
+
+    Case 1: Qualified (col_table_ref given) → alias lookup → done
+    Case 2: Unqualified → search all tables in scope:
+      - Derived table has this column in its map → match
+      - Base table → could have it (we don't know the schema)
+      - If exactly one derived table has it → use that
+      - Otherwise → list all base tables as ambiguous
+    """
+    if col_table_ref:
+        actual_table = scope.get(col_table_ref, col_table_ref)
+        return [(actual_table, col_name)]
+
+    # Unqualified: search scope
+    # First, check derived tables — they have known column sets
+    derived_matches = []
+    base_tables_in_scope = []
+
+    for alias, actual_table in scope.items():
+        if registry.is_derived(actual_table):
+            derived_cols = registry.get_derived_columns(actual_table)
+            if col_name in derived_cols:
+                derived_matches.append((actual_table, col_name))
+        elif registry.is_base(actual_table):
+            base_tables_in_scope.append((actual_table, col_name))
+
+    if len(derived_matches) == 1:
+        return derived_matches
+    elif derived_matches:
+        # Multiple derived tables have this column — ambiguous
+        logger.debug(f"    Ambiguous (derived): {col_name} in {derived_matches}")
+        return derived_matches
+
+    # No derived table match — must come from a base table
+    if len(base_tables_in_scope) == 1:
+        return base_tables_in_scope
+    elif base_tables_in_scope:
+        logger.debug(f"    Ambiguous (base): {col_name} in {base_tables_in_scope}")
+        return base_tables_in_scope
+
+    return [("UNRESOLVED", col_name)]
+
+
+def _collect_non_select_columns(parsed, registry: TableRegistry,
+                                 block_result: dict, seen: set):
+    """
+    Collect column references from WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY.
+    These columns indicate base table usage even if not in the SELECT list.
+    """
+    # Build global alias map from ALL Table nodes
+    global_scope = {}
+    for table_node in parsed.find_all(exp.Table):
+        tname = table_node.name.upper()
+        talias = table_node.alias.upper() if table_node.alias else tname
+        global_scope[talias] = tname
+        if not registry.is_known(tname):
+            registry.register_base(tname)
+
+    # Walk ALL Column nodes
+    for col_node in parsed.find_all(exp.Column):
+        col_name = col_node.name.upper()
+        col_table_ref = col_node.table.upper() if col_node.table else ""
+
+        if not col_table_ref:
+            continue  # Skip unqualified — already handled in SELECT resolution
+
+        actual_table = global_scope.get(col_table_ref, col_table_ref)
+
+        for base_tbl, base_col in registry.resolve(actual_table, col_name):
+            pair = (base_tbl, base_col)
+            if pair not in seen:
+                seen.add(pair)
+                block_result["columns"].append({
+                    "base_table": base_tbl,
                     "column": base_col,
-                    "original_ref": raw_ref,
-                    "resolved_via": resolved_via,
                 })
 
-    return records
 
+# ===========================================================================
+# Phase 4: Output — JSON + DataFrame
+# ===========================================================================
 
-def generate_report(records: list[dict], blocks: list[BlockInfo],
-                    lineage: LineageGraph, output_path: str) -> dict:
-    """Write full analysis to JSON."""
-    base_tables_set = sorted(lineage.base_tables)
-    base_cols = {r["column"] for r in records if r["base_table"] != "UNRESOLVED"}
+def generate_report(block_results: list[dict], registry: TableRegistry,
+                    output_path: str) -> dict:
+    all_base_tables = registry.get_base_tables()
+
+    all_columns = set()
+    for br in block_results:
+        for c in br["columns"]:
+            if registry.is_base(c["base_table"]):
+                all_columns.add((c["base_table"], c["column"]))
 
     report = {
         "summary": {
-            "total_blocks": len(blocks),
-            "total_base_tables": len(base_tables_set),
-            "total_columns": len(base_cols),
-            "base_tables": base_tables_set,
+            "total_blocks": len(block_results),
+            "total_base_tables": len(all_base_tables),
+            "total_base_columns": len(all_columns),
+            "base_tables": all_base_tables,
         },
-        "lineage": {
-            "insert_into_targets": {
-                k: {col: list(src) for col, src in v.items()}
-                for k, v in lineage.insert_targets.items()
-            },
-            "cte_chains": {
-                bname: {
-                    "source_tables": sorted(binfo.cte_definitions.get(cte, {}).get("source_tables", set()))
-                    for cte in binfo.cte_definitions
-                }
-                for binfo in blocks
-                for bname in [f"block_{binfo.block_index}"]
-            },
-        },
-        "columns": records,
+        "blocks": [],
     }
 
+    for br in block_results:
+        report["blocks"].append({
+            "block_index": br["block_index"],
+            "insert_target": br["insert_target"],
+            "ctes": br["ctes_found"],
+            "base_tables_referenced": br["base_tables_found"],
+            "columns": br["columns"],
+            "parse_errors": br["parse_errors"],
+        })
+
     with open(output_path, 'w') as f:
-        json.dump(report, f, indent=2, default=_json_default)
+        json.dump(report, f, indent=2)
 
     logger.info(f"JSON report written to {output_path}")
     return report
 
 
-def _json_default(obj):
-    """Handle sets and other non-serializable types."""
-    if isinstance(obj, set):
-        return sorted(obj)
-    return str(obj)
-
-
-def build_dataframe(records: list[dict]):
+def build_dataframe(block_results: list[dict], registry: TableRegistry):
     """
-    Build a DataFrame with one row per unique (base_table, column) pair.
+    Build a DataFrame: one row per unique (base_table, column).
 
     Columns:
-    - base_table   : the ultimate source base table
-    - schema       : schema if known
-    - column       : column name on that base table
-    - block_index  : which block first referenced it
-    - original_ref : the alias/table ref as written in the SQL
-    - resolved_via : 'direct' | 'cte' | 'insert_into' | 'unresolved'
+    - base_table     : the ultimate source base table
+    - column         : column name
+    - first_seen_in  : block_index where first encountered
+    - referenced_in  : list of block indices that reference this column
     """
+    col_info: dict[tuple[str, str], dict] = {}
+
+    for br in block_results:
+        for c in br["columns"]:
+            bt = c["base_table"]
+            col = c["column"]
+            if not registry.is_base(bt):
+                continue
+            key = (bt, col)
+            if key not in col_info:
+                col_info[key] = {
+                    "base_table": bt,
+                    "column": col,
+                    "first_seen_in": br["block_index"],
+                    "referenced_in": [],
+                }
+            col_info[key]["referenced_in"].append(br["block_index"])
+
+    records = list(col_info.values())
+    for r in records:
+        r["referenced_in"] = sorted(set(r["referenced_in"]))
+
     if not PANDAS_AVAILABLE:
         logger.warning("pandas not installed — returning list of dicts")
         return records
@@ -720,87 +771,67 @@ def build_dataframe(records: list[dict]):
     if df.empty:
         return df
 
-    df = df.sort_values(['base_table', 'column', 'block_index']).reset_index(drop=True)
-    return df
+    return df.sort_values(["base_table", "column"]).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Main
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
     """
-    Full pipeline: read -> extract -> clean -> parse -> resolve lineage -> report.
-
-    Returns:
-        (report_dict, DataFrame)
+    Full pipeline. Returns (report_dict, DataFrame).
     """
     logger.info(f"Reading {input_path}")
     text = Path(input_path).read_text(encoding='utf-8', errors='replace')
 
     # Phase 1: Extract
     raw_blocks = extract_execute_immediate_blocks(text)
-
     if not raw_blocks:
         logger.warning("No EXECUTE IMMEDIATE blocks found!")
         logger.info("Attempting to parse entire file as plain SQL...")
         raw_blocks = [text]
 
-    # Phase 2+3: Clean, parse each block, detect INSERT INTO targets
-    parsed_blocks = []
+    # Shared registry across all blocks
+    registry = TableRegistry()
+    block_results = []
+
     for i, raw_sql in enumerate(raw_blocks):
         logger.info(f"Processing block {i + 1}/{len(raw_blocks)}")
 
-        insert_target = _detect_insert_target(raw_sql)
-        if insert_target:
-            logger.info(f"  INSERT INTO target: {insert_target}")
-
+        # Phase 2: Clean
         cleaned = clean_sql_for_parsing(raw_sql)
-        logger.debug(f"  Cleaned SQL (first 300 chars): {cleaned[:300]}")
+        logger.debug(f"  Cleaned (first 300): {cleaned[:300]}")
 
-        info = parse_block(cleaned, raw_sql, block_index=i + 1,
-                           insert_target=insert_target)
-        parsed_blocks.append(info)
+        # Phase 3: Walk parse tree, build registry
+        res = process_block(cleaned, registry, block_index=i + 1)
+        block_results.append(res)
 
-        if info.parse_errors:
-            for err in info.parse_errors:
+        if res["parse_errors"]:
+            for err in res["parse_errors"]:
                 logger.warning(f"  Block {i + 1}: {err}")
         else:
             logger.info(
-                f"  Block {i + 1}: {len(info.base_tables)} base tables, "
-                f"{len(info.cte_definitions)} CTEs, "
-                f"{len(info.select_columns)} column refs"
+                f"  Block {i + 1}: "
+                f"{len(res['base_tables_found'])} base tables, "
+                f"{len(res['ctes_found'])} CTEs, "
+                f"{len(res['columns'])} resolved columns"
+                + (f", INSERT INTO {res['insert_target']}"
+                   if res['insert_target'] else "")
             )
 
-    # Phase 3b: Build lineage graph across all blocks
-    lineage = LineageGraph()
-    for info in parsed_blocks:
-        lineage.add_block(info)
-
-    logger.info(f"Lineage graph: {len(lineage.base_tables)} base tables, "
-                f"{len(lineage.insert_targets)} INSERT targets, "
-                f"{len(lineage.edges)} edges")
-
-    # Phase 4: Flatten to base table columns
-    records = build_final_results(parsed_blocks, lineage)
-    report = generate_report(records, parsed_blocks, lineage, output_path)
-    df = build_dataframe(records)
-
-    # Console summary
-    base_only = [r for r in records if r["base_table"] != "UNRESOLVED"]
-    unresolved = [r for r in records if r["base_table"] == "UNRESOLVED"]
+    # Phase 4: Output
+    report = generate_report(block_results, registry, output_path)
+    df = build_dataframe(block_results, registry)
 
     print(f"\n{'=' * 60}")
     print(f"  Analysis Complete")
     print(f"{'=' * 60}")
-    print(f"  Blocks analyzed:    {len(parsed_blocks)}")
-    print(f"  Base tables:        {sorted(lineage.base_tables)}")
-    print(f"  Resolved columns:   {len(base_only)}")
-    if unresolved:
-        print(f"  Unresolved columns: {len(unresolved)}")
-    if lineage.insert_targets:
-        print(f"  INSERT INTO targets tracked: {sorted(lineage.insert_targets.keys())}")
-    print(f"  JSON report: {output_path}")
+    print(f"  Blocks analyzed:    {len(block_results)}")
+    print(f"  Base tables:        {registry.get_base_tables()}")
+    total_cols = sum(len(br['columns']) for br in block_results)
+    print(f"  Resolved columns:   {total_cols}")
+    print(f"  JSON report:        {output_path}")
     print(f"{'=' * 60}\n")
 
     return report, df
