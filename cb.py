@@ -523,12 +523,20 @@ def _process_scope(scope, dag, scope_col_maps, block_index, scope_name):
         return col_map
 
     # Build source lookup from scope.sources
-    source_info = {}  # alias_upper -> (actual_name, is_scope, scope_ref)
+    source_info = {}  # alias_upper -> (actual_name, is_scope_like, scope_ref)
+    # Note: is_scope_like=True means it's either a sqlglot Scope OR a table
+    # that we know is derived (from a previous block's INSERT INTO).
     for alias_name, source in scope.sources.items():
         alias_upper = alias_name.upper()
         if isinstance(source, exp.Table):
             tname = source.name.upper()
-            source_info[alias_upper] = (tname, False, None)
+            # Check if this "physical" table is actually a derived table
+            # from a previous EXECUTE IMMEDIATE block (INSERT INTO target)
+            if dag.has_scope(tname):
+                # Treat it like a scope — we know its columns from the DAG
+                source_info[alias_upper] = (tname, True, None)
+            else:
+                source_info[alias_upper] = (tname, False, None)
         elif isinstance(source, Scope):
             source_info[alias_upper] = (alias_upper, True, source)
 
@@ -592,64 +600,99 @@ def _expand_star(table_ref, source_info, scope, dag, scope_col_maps,
     for alias_upper, info in targets.items():
         if info is None:
             continue
-        actual_name, is_scope, scope_ref = info
+        actual_name, is_scope_like, scope_ref = info
 
-        if is_scope and scope_ref is not None:
-            sub_map = scope_col_maps.get(id(scope_ref), {})
-            if not sub_map:
-                sub_map = dag.get_scope_columns(alias_upper)
+        if is_scope_like:
+            if scope_ref is not None:
+                # Within-block scope (CTE/subquery)
+                sub_map = scope_col_maps.get(id(scope_ref), {})
+                if not sub_map:
+                    sub_map = dag.get_scope_columns(alias_upper)
+            else:
+                # Cross-block derived table
+                sub_map = dag.get_scope_columns(actual_name)
+
             for sub_col in sub_map:
                 if sub_col:
-                    col_map[sub_col] = [(alias_upper, sub_col)]
+                    col_map[sub_col] = [(actual_name, sub_col)]
         else:
+            # Physical table — check if we know its columns
             known = dag.get_scope_columns(actual_name)
             if known:
                 for col in known:
                     if col:
                         col_map[col] = [(actual_name, col)]
+            else:
+                logger.debug(f"    * from base table {actual_name} — columns unknown")
 
 
 def _resolve_column(col_name, col_table_ref, source_info,
                      scope, dag, scope_col_maps,
                      block_index, scope_name):
     """
-    Resolve one column. If it resolves to a physical table, also add
-    a base leaf edge to the DAG.
+    Resolve one column. If it resolves to a physical table (not known as
+    derived in the DAG), add a base leaf edge.
+    If it resolves to a table known in the DAG from a previous block,
+    return its scope columns so the trace continues through.
     """
     if col_table_ref:
         info = source_info.get(col_table_ref)
         if info:
-            actual_name, is_scope, scope_ref = info
-            if is_scope and scope_ref is not None:
-                sub_map = scope_col_maps.get(id(scope_ref), {})
-                if col_name in sub_map:
-                    return sub_map[col_name]
-                return [(actual_name, col_name)]
+            actual_name, is_scope_like, scope_ref = info
+            if is_scope_like:
+                if scope_ref is not None:
+                    # sqlglot Scope (CTE/subquery within this block)
+                    sub_map = scope_col_maps.get(id(scope_ref), {})
+                    if col_name in sub_map:
+                        return sub_map[col_name]
+                    return [(actual_name, col_name)]
+                else:
+                    # Cross-block derived table (INSERT INTO from earlier block)
+                    cross_map = dag.get_scope_columns(actual_name)
+                    if col_name in cross_map:
+                        return cross_map[col_name]
+                    return [(actual_name, col_name)]
             else:
-                # Physical table — add base leaf edge
+                # Truly physical table — add base leaf edge
                 dag.add_base_leaf(actual_name, col_name,
                                   block_index, scope_name)
                 return [(actual_name, col_name)]
-        # Unknown alias — treat as physical
+        # Unknown alias — check DAG before assuming base
+        if dag.has_scope(col_table_ref):
+            cross_map = dag.get_scope_columns(col_table_ref)
+            if col_name in cross_map:
+                return cross_map[col_name]
+            return [(col_table_ref, col_name)]
         dag.add_base_leaf(col_table_ref, col_name, block_index, scope_name)
         return [(col_table_ref, col_name)]
 
     # Unqualified — single source
     if len(source_info) == 1:
-        alias_upper, (actual_name, is_scope, scope_ref) = next(iter(source_info.items()))
-        if is_scope:
-            return [(alias_upper, col_name)]
+        alias_upper, (actual_name, is_scope_like, scope_ref) = next(iter(source_info.items()))
+        if is_scope_like:
+            if scope_ref is not None:
+                sub_map = scope_col_maps.get(id(scope_ref), {})
+                if col_name in sub_map:
+                    return sub_map[col_name]
+            else:
+                cross_map = dag.get_scope_columns(actual_name)
+                if col_name in cross_map:
+                    return cross_map[col_name]
+            return [(actual_name, col_name)]
         dag.add_base_leaf(actual_name, col_name, block_index, scope_name)
         return [(actual_name, col_name)]
 
     # Multiple sources — disambiguate
     scope_matches = []
     base_matches = []
-    for alias_upper, (actual_name, is_scope, scope_ref) in source_info.items():
-        if is_scope and scope_ref is not None:
-            sub_map = scope_col_maps.get(id(scope_ref), {})
+    for alias_upper, (actual_name, is_scope_like, scope_ref) in source_info.items():
+        if is_scope_like:
+            if scope_ref is not None:
+                sub_map = scope_col_maps.get(id(scope_ref), {})
+            else:
+                sub_map = dag.get_scope_columns(actual_name)
             if col_name in sub_map:
-                scope_matches.append((alias_upper, col_name))
+                scope_matches.append((actual_name, col_name))
         else:
             base_matches.append((actual_name, col_name))
 
@@ -675,7 +718,11 @@ def _add_filter_edges(scope, dag, scope_col_maps, block_index, root_name):
     for alias_name, source in scope.sources.items():
         alias_upper = alias_name.upper()
         if isinstance(source, exp.Table):
-            source_info[alias_upper] = (source.name.upper(), False, None)
+            tname = source.name.upper()
+            if dag.has_scope(tname):
+                source_info[alias_upper] = (tname, True, None)
+            else:
+                source_info[alias_upper] = (tname, False, None)
         elif isinstance(source, Scope):
             source_info[alias_upper] = (alias_upper, True, source)
 
