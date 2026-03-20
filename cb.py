@@ -261,25 +261,14 @@ def clean_sql_for_parsing(raw_sql: str) -> str:
 # Phase 3: DAG-based lineage using sqlglot.optimizer.scope.traverse_scope
 # ===========================================================================
 #
-# The lineage is stored as an edge table (list of dicts). Each row is:
+# The DAG edge table is the SINGLE SOURCE OF TRUTH.
+# Every edge: (output_table, output_column) → (source_table, source_column)
+# Base tables are leaf nodes: (base_table, col) → (None, None)
 #
-#   output_table  | output_column | source_table | source_column | scope_name | scope_type
-#   (root)        | ALERT_DATE    | seq_alerts   | ACCT_INTRL_ID | block_1    | root
-#   seq_alerts    | ACCT_INTRL_ID | check_EP_LLV | ACCT_INTRL_ID | seq_alerts | cte
-#   check_EP_LLV  | ACCT_INTRL_ID | None         | None          | —          | base
+# df_edges = the raw DAG
+# df_columns = DERIVED from df_edges by tracing root edges to leaf edges
 #
-# Children approach: output → sources. To find base tables, find leaf nodes
-# (edges where source_table is None, or source has no further children).
-#
-# traverse_scope yields scopes in DFS post-order (CTEs first, then main SELECT).
-# For each scope we:
-#   1. Look at scope.sources to know what tables/CTEs are available
-#   2. For each SELECT column, record edges: (this_scope, col) → (source, col)
-#   3. For sa.*, expand by looking up the source scope's known columns
-#   4. For WHERE/GROUP BY/etc. columns, also record edges
-#
-# Cross-block: INSERT INTO targets get their edges added, so block N+1
-# reading from that table can follow the edges further.
+# No separate resolution path. Everything comes from the edges.
 
 try:
     from sqlglot.optimizer.scope import traverse_scope, Scope, ScopeType
@@ -290,29 +279,43 @@ except ImportError:
 
 class LineageDAG:
     """
-    Stores column lineage as an edge table.
+    Column lineage as an edge table.
     Each edge: (output_table, output_column) → (source_table, source_column)
-    Base table columns have source_table = None.
-
-    Also tracks scope-level metadata for each edge.
+    Base table leaf edges have source_table = None, source_column = None.
     """
 
     def __init__(self):
-        self.edges = []  # list of edge dicts
-        # Quick lookup: (table_upper, col_upper) -> list of source edges
-        self._children = {}  # (tbl, col) -> [(src_tbl, src_col), ...]
-        # Known scope column maps for cross-block resolution
-        self._scope_columns = {}  # scope_name_upper -> {col_upper: [(src_tbl, src_col)]}
+        self.edges = []
+        # Index: (out_tbl, out_col) -> [(src_tbl, src_col), ...]
+        self._children = {}
+        # Scope column maps for cross-scope/cross-block lookup
+        self._scope_columns = {}  # scope_name_upper -> {col: [(src_tbl, src_col)]}
+        # Track which (table, col) already have a base edge to avoid duplicates
+        self._base_edges_added = set()
 
     def add_edge(self, output_table, output_column,
                  source_table, source_column,
                  block_index, scope_name, scope_type, clause="SELECT"):
-        """Add one lineage edge."""
+        """Add one lineage edge. Deduplicates automatically."""
+        ot = output_table.upper() if output_table else None
+        oc = output_column.upper() if output_column else None
+        st = source_table.upper() if source_table else None
+        sc = source_column.upper() if source_column else None
+
+        # Deduplicate
+        dedup_key = (ot, oc, st, sc, scope_type, clause)
+        if hasattr(self, '_seen_edges'):
+            if dedup_key in self._seen_edges:
+                return
+        else:
+            self._seen_edges = set()
+        self._seen_edges.add(dedup_key)
+
         edge = {
-            "output_table": output_table.upper() if output_table else None,
-            "output_column": output_column.upper() if output_column else None,
-            "source_table": source_table.upper() if source_table else None,
-            "source_column": source_column.upper() if source_column else None,
+            "output_table": ot,
+            "output_column": oc,
+            "source_table": st,
+            "source_column": sc,
             "block_index": block_index,
             "scope_name": scope_name,
             "scope_type": scope_type,
@@ -320,25 +323,23 @@ class LineageDAG:
         }
         self.edges.append(edge)
 
-        # Index for lookups
-        out_key = (edge["output_table"], edge["output_column"])
+        # Index
+        out_key = (ot, oc)
         if out_key not in self._children:
             self._children[out_key] = []
-        if edge["source_table"]:
-            self._children[out_key].append(
-                (edge["source_table"], edge["source_column"])
-            )
+        if st is not None:
+            self._children[out_key].append((st, sc))
 
-    def add_base(self, table, column, block_index, scope_name, clause="SELECT"):
-        """Register a base table column (leaf node — no source)."""
+    def add_base_leaf(self, table, column, block_index, scope_name, clause="SELECT"):
+        """Add a base table leaf edge: (table, col) → (None, None)."""
+        key = (table.upper(), column.upper())
+        if key in self._base_edges_added:
+            return
+        self._base_edges_added.add(key)
         self.add_edge(table, column, None, None,
                       block_index, scope_name, "base", clause)
 
     def register_scope_columns(self, scope_name, col_map):
-        """
-        Register a scope's output columns for cross-block or cross-scope lookup.
-        col_map: {COL_UPPER: [(source_table, source_col), ...]}
-        """
         self._scope_columns[scope_name.upper()] = col_map
 
     def get_scope_columns(self, scope_name):
@@ -348,64 +349,55 @@ class LineageDAG:
         return scope_name.upper() in self._scope_columns
 
     def get_base_tables(self):
-        """Find all tables that appear as source but never as output of another edge."""
-        all_sources = set()
-        all_outputs = set()
-        for e in self.edges:
-            if e["output_table"]:
-                all_outputs.add(e["output_table"])
-            if e["source_table"]:
-                all_sources.add(e["source_table"])
-
-        # Base tables = appear as source but are never the output of a derived edge
-        # (or appear in base-type edges)
-        base_from_edges = {e["output_table"] for e in self.edges
-                          if e["scope_type"] == "base" and e["output_table"]}
-        # Also: tables that are sources but never outputs
-        source_only = all_sources - all_outputs
-        return sorted(base_from_edges | source_only)
+        """Base tables = tables that have leaf edges (source_table is None)."""
+        return sorted({e["output_table"] for e in self.edges
+                       if e["scope_type"] == "base" and e["output_table"]})
 
     def get_leaf_columns(self):
-        """Get all (table, column) pairs that are base table leaves."""
-        base_tables = set(self.get_base_tables())
-        leaves = set()
-        for e in self.edges:
-            if e["source_table"] and e["source_table"] in base_tables and e["source_column"]:
-                leaves.add((e["source_table"], e["source_column"]))
-            if e["scope_type"] == "base" and e["output_table"] and e["output_column"]:
-                leaves.add((e["output_table"], e["output_column"]))
-        return sorted(leaves)
+        """All (table, column) pairs from base/leaf edges."""
+        return sorted({(e["output_table"], e["output_column"])
+                       for e in self.edges
+                       if e["scope_type"] == "base"
+                       and e["output_table"] and e["output_column"]})
 
-    def trace_to_base(self, table, column, _visited=None):
+    def get_root_edges(self, block_index=None):
+        """Get edges from root scope (the final SELECT output)."""
+        roots = [e for e in self.edges if e["scope_type"] == "root"]
+        if block_index is not None:
+            roots = [e for e in roots if e["block_index"] == block_index]
+        return roots
+
+    def trace_to_leaves(self, table, column, _visited=None):
         """
-        Follow children edges from (table, column) down to base table leaves.
-        Returns list of (base_table, base_column) tuples.
+        Follow children edges down to base table leaves.
+        Returns list of (base_table, base_column).
         """
         if _visited is None:
             _visited = set()
-        key = (table.upper(), column.upper())
+        key = (table.upper() if table else None,
+               column.upper() if column else None)
         if key in _visited:
             return [key]
         _visited.add(key)
 
         children = self._children.get(key, [])
         if not children:
-            return [key]  # leaf node = base table
+            return [key]  # leaf
 
         results = []
         for src_tbl, src_col in children:
-            results.extend(self.trace_to_base(src_tbl, src_col, _visited.copy()))
+            results.extend(self.trace_to_leaves(src_tbl, src_col, _visited.copy()))
         return results if results else [key]
 
 
 # ===========================================================================
-# Phase 3b: Walk scopes and build the DAG
+# Phase 3b: Walk scopes, build edges
 # ===========================================================================
 
 def process_block(cleaned_sql: str, dag: LineageDAG,
                   block_index: int) -> dict:
     """
-    Parse one SQL block, traverse scopes, build lineage edges in the DAG.
+    Parse one SQL block, traverse scopes, add all lineage edges to the DAG.
     """
     result = {
         "block_index": block_index,
@@ -413,7 +405,6 @@ def process_block(cleaned_sql: str, dag: LineageDAG,
         "insert_target": None,
         "ctes_found": [],
         "base_tables_found": [],
-        "columns": [],
         "parse_errors": [],
     }
 
@@ -447,24 +438,23 @@ def process_block(cleaned_sql: str, dag: LineageDAG,
             insert_target = target_table.name.upper()
             result["insert_target"] = insert_target
 
-    # --- Traverse scopes ---
+    # --- Traverse scopes (post-order: CTEs first, main SELECT last) ---
     try:
         scopes = traverse_scope(parsed)
     except Exception as e:
         result["parse_errors"].append(f"traverse_scope error: {e}")
         return result
 
-    # scope_id -> col_map for cross-scope lookup within this block
-    scope_col_maps = {}
-    main_scope = None
+    scope_col_maps = {}  # id(scope) -> col_map
     main_col_map = {}
 
     for scope in scopes:
         scope_type = scope.scope_type
         scope_name = _get_scope_name(scope)
 
-        col_map = _build_scope_col_map(scope, dag, scope_col_maps,
-                                        block_index, scope_name)
+        # Build column map for this scope AND add edges to the DAG
+        col_map = _process_scope(scope, dag, scope_col_maps,
+                                  block_index, scope_name)
         scope_col_maps[id(scope)] = col_map
 
         if scope_type == ScopeType.CTE:
@@ -472,116 +462,77 @@ def process_block(cleaned_sql: str, dag: LineageDAG,
             if cte_name:
                 result["ctes_found"].append(cte_name)
                 dag.register_scope_columns(cte_name, col_map)
-                # Add edges: cte.col → source.col
+                # CTE edges: cte.col → source.col
                 for out_col, sources in col_map.items():
                     for src_tbl, src_col in sources:
                         dag.add_edge(cte_name, out_col, src_tbl, src_col,
                                      block_index, cte_name, "cte")
 
         if scope_type == ScopeType.ROOT:
-            main_scope = scope
             main_col_map = col_map
 
-    # --- Process the root scope's output ---
-    if main_scope is not None:
-        root_name = insert_target if insert_target else f"__root_block_{block_index}"
+    # --- Root scope edges ---
+    root_name = insert_target if insert_target else f"__ROOT_BLOCK_{block_index}"
 
-        # Add edges for the main SELECT columns
-        for out_col, sources in main_col_map.items():
-            for src_tbl, src_col in sources:
-                dag.add_edge(root_name, out_col, src_tbl, src_col,
-                             block_index, root_name, "root")
-
-        # Register for cross-block lookup
-        dag.register_scope_columns(root_name, main_col_map)
-
-        # Collect WHERE/GROUP BY/etc. columns from the root scope
-        _collect_filter_edges(main_scope, dag, scope_col_maps,
-                              block_index, root_name)
-
-    # --- Build the result columns by tracing to base ---
-    seen = set()
     for out_col, sources in main_col_map.items():
         for src_tbl, src_col in sources:
-            base_list = dag.trace_to_base(src_tbl, src_col)
-            for base_tbl, base_col in base_list:
-                pair = (base_tbl, base_col, "SELECT")
-                if pair not in seen:
-                    seen.add(pair)
-                    result["columns"].append({
-                        "base_table": base_tbl,
-                        "column": base_col,
-                        "output_name": out_col,
-                        "source_path": f"{src_tbl}.{src_col}",
-                        "clause": "SELECT",
-                        "is_base": base_tbl in dag.get_base_tables()
-                                   if dag.get_base_tables() else True,
-                    })
+            dag.add_edge(root_name, out_col, src_tbl, src_col,
+                         block_index, root_name, "root")
 
-    # Also trace filter columns
-    if main_scope is not None:
-        _collect_filter_results(main_scope, dag, scope_col_maps,
-                                block_index, result, seen)
+    dag.register_scope_columns(root_name, main_col_map)
 
-    result["base_tables_found"] = sorted({
-        c["base_table"] for c in result["columns"]
-        if c.get("is_base", False)
-    })
+    # --- Filter column edges (WHERE, GROUP BY, etc.) from root scope ---
+    for scope in scopes:
+        if scope.scope_type == ScopeType.ROOT:
+            _add_filter_edges(scope, dag, scope_col_maps,
+                              block_index, root_name)
+            break
 
+    result["base_tables_found"] = dag.get_base_tables()
     return result
 
 
 def _get_scope_name(scope) -> str:
-    """Get a human-readable name for a scope."""
     if scope.scope_type == ScopeType.CTE:
-        return _get_cte_name(scope) or "cte_unknown"
+        return _get_cte_name(scope) or "CTE_UNKNOWN"
     elif scope.scope_type == ScopeType.ROOT:
-        return "__root"
+        return "__ROOT"
     elif scope.scope_type == ScopeType.SUBQUERY:
-        return "__subquery"
+        return "__SUBQUERY"
     elif scope.scope_type == ScopeType.DERIVED_TABLE:
         alias = scope.expression.parent.alias if scope.expression.parent else None
-        return alias.upper() if alias else "__derived"
-    return "__unknown"
+        return alias.upper() if alias else "__DERIVED"
+    return "__UNKNOWN"
 
 
 def _get_cte_name(scope) -> Optional[str]:
-    """Extract the CTE alias name from a CTE scope."""
-    # The CTE scope's expression is the Select inside the CTE.
-    # The CTE node is the parent of that Select.
     parent = scope.expression.parent
     if parent and hasattr(parent, 'alias') and parent.alias:
         return parent.alias.upper()
     return None
 
 
-def _build_scope_col_map(scope, dag: LineageDAG, scope_col_maps: dict,
-                          block_index: int, scope_name: str) -> dict:
+def _process_scope(scope, dag, scope_col_maps, block_index, scope_name):
     """
-    For one scope, build {OUTPUT_COL: [(source_table, source_col), ...]}.
-    Uses scope.sources to resolve aliases.
+    Build {OUTPUT_COL: [(source_table, source_col), ...]} for one scope.
+    Also adds base leaf edges for physical table columns.
     """
     col_map = {}
     select_node = scope.expression
-
     if not isinstance(select_node, exp.Select):
         return col_map
 
     # Build source lookup from scope.sources
-    # alias_upper -> (actual_name_upper, is_scope, scope_ref_or_None)
-    source_info = {}
+    source_info = {}  # alias_upper -> (actual_name, is_scope, scope_ref)
     for alias_name, source in scope.sources.items():
         alias_upper = alias_name.upper()
         if isinstance(source, exp.Table):
             tname = source.name.upper()
             source_info[alias_upper] = (tname, False, None)
-            # If not already known as derived, note it's a base table
-            if not dag.has_scope(tname):
-                pass  # Will be added as base when actual columns are resolved
         elif isinstance(source, Scope):
             source_info[alias_upper] = (alias_upper, True, source)
 
-    # Process each SELECT expression
+    # Process SELECT expressions
     for sel_expr in select_node.selects:
         _process_select_expr(sel_expr, source_info, scope, dag,
                              scope_col_maps, col_map, block_index, scope_name)
@@ -591,21 +542,20 @@ def _build_scope_col_map(scope, dag: LineageDAG, scope_col_maps: dict,
 
 def _process_select_expr(sel_expr, source_info, scope, dag,
                           scope_col_maps, col_map, block_index, scope_name):
-    """Process one SELECT expression, adding entries to col_map."""
+    """Process one SELECT expression, populate col_map, add base leaf edges."""
 
-    # --- Handle * and t.* ---
+    # Handle * and t.*
     if isinstance(sel_expr, exp.Star):
         _expand_star(None, source_info, scope, dag, scope_col_maps,
                      col_map, block_index, scope_name)
         return
-
     if isinstance(sel_expr, exp.Column) and isinstance(sel_expr.this, exp.Star):
         table_ref = sel_expr.table.upper() if sel_expr.table else None
         _expand_star(table_ref, source_info, scope, dag, scope_col_maps,
                      col_map, block_index, scope_name)
         return
 
-    # --- Determine output name ---
+    # Output name
     if isinstance(sel_expr, exp.Alias):
         output_name = sel_expr.alias.upper()
     elif isinstance(sel_expr, exp.Column):
@@ -615,9 +565,9 @@ def _process_select_expr(sel_expr, source_info, scope, dag,
         if col and not isinstance(col.this, exp.Star):
             output_name = col.name.upper()
         else:
-            return  # literal
+            return
 
-    # --- Find all column references in this expression ---
+    # Resolve column references
     sources = []
     for col_node in sel_expr.find_all(exp.Column):
         if isinstance(col_node.this, exp.Star):
@@ -626,7 +576,8 @@ def _process_select_expr(sel_expr, source_info, scope, dag,
         col_table_ref = col_node.table.upper() if col_node.table else ""
 
         resolved = _resolve_column(col_name, col_table_ref, source_info,
-                                    scope, scope_col_maps)
+                                    scope, dag, scope_col_maps,
+                                    block_index, scope_name)
         sources.extend(resolved)
 
     if sources:
@@ -635,11 +586,8 @@ def _process_select_expr(sel_expr, source_info, scope, dag,
 
 def _expand_star(table_ref, source_info, scope, dag, scope_col_maps,
                   col_map, block_index, scope_name):
-    """Expand SELECT * or SELECT t.* by looking up source columns."""
-    if table_ref:
-        targets = {table_ref: source_info.get(table_ref)}
-    else:
-        targets = source_info
+    """Expand * or t.* by looking up source columns."""
+    targets = {table_ref: source_info.get(table_ref)} if table_ref else source_info
 
     for alias_upper, info in targets.items():
         if info is None:
@@ -647,30 +595,26 @@ def _expand_star(table_ref, source_info, scope, dag, scope_col_maps,
         actual_name, is_scope, scope_ref = info
 
         if is_scope and scope_ref is not None:
-            # CTE or subquery — get its column map
             sub_map = scope_col_maps.get(id(scope_ref), {})
             if not sub_map:
-                # Try cross-block lookup
                 sub_map = dag.get_scope_columns(alias_upper)
             for sub_col in sub_map:
                 if sub_col:
                     col_map[sub_col] = [(alias_upper, sub_col)]
         else:
-            # Physical table — check if we know its columns from the DAG
             known = dag.get_scope_columns(actual_name)
             if known:
                 for col in known:
                     if col:
                         col_map[col] = [(actual_name, col)]
-            else:
-                logger.debug(f"    * from base table {actual_name} — columns unknown")
 
 
 def _resolve_column(col_name, col_table_ref, source_info,
-                     scope, scope_col_maps):
+                     scope, dag, scope_col_maps,
+                     block_index, scope_name):
     """
-    Resolve a column reference within a scope.
-    Returns [(source_table, source_col), ...]
+    Resolve one column. If it resolves to a physical table, also add
+    a base leaf edge to the DAG.
     """
     if col_table_ref:
         info = source_info.get(col_table_ref)
@@ -682,17 +626,23 @@ def _resolve_column(col_name, col_table_ref, source_info,
                     return sub_map[col_name]
                 return [(actual_name, col_name)]
             else:
+                # Physical table — add base leaf edge
+                dag.add_base_leaf(actual_name, col_name,
+                                  block_index, scope_name)
                 return [(actual_name, col_name)]
+        # Unknown alias — treat as physical
+        dag.add_base_leaf(col_table_ref, col_name, block_index, scope_name)
         return [(col_table_ref, col_name)]
 
-    # Unqualified — single source → easy
+    # Unqualified — single source
     if len(source_info) == 1:
         alias_upper, (actual_name, is_scope, scope_ref) = next(iter(source_info.items()))
         if is_scope:
             return [(alias_upper, col_name)]
+        dag.add_base_leaf(actual_name, col_name, block_index, scope_name)
         return [(actual_name, col_name)]
 
-    # Multiple sources — try scope sources with known columns first
+    # Multiple sources — disambiguate
     scope_matches = []
     base_matches = []
     for alias_upper, (actual_name, is_scope, scope_ref) in source_info.items():
@@ -708,15 +658,19 @@ def _resolve_column(col_name, col_table_ref, source_info,
     if scope_matches:
         return scope_matches
     if len(base_matches) == 1:
+        tbl = base_matches[0][0]
+        dag.add_base_leaf(tbl, col_name, block_index, scope_name)
         return base_matches
     if base_matches:
+        for tbl, col in base_matches:
+            dag.add_base_leaf(tbl, col, block_index, scope_name)
         return base_matches
 
     return [("UNRESOLVED", col_name)]
 
 
-def _collect_filter_edges(scope, dag, scope_col_maps, block_index, root_name):
-    """Add DAG edges for columns in WHERE, JOIN ON, GROUP BY, etc."""
+def _add_filter_edges(scope, dag, scope_col_maps, block_index, root_name):
+    """Add edges for WHERE, JOIN ON, GROUP BY, HAVING, ORDER BY columns."""
     source_info = {}
     for alias_name, source in scope.sources.items():
         alias_upper = alias_name.upper()
@@ -736,49 +690,11 @@ def _collect_filter_edges(scope, dag, scope_col_maps, block_index, root_name):
             continue
 
         resolved = _resolve_column(col_name, col_table_ref, source_info,
-                                    scope, scope_col_maps)
+                                    scope, dag, scope_col_maps,
+                                    block_index, root_name)
         for src_tbl, src_col in resolved:
             dag.add_edge(root_name, col_name, src_tbl, src_col,
                          block_index, root_name, "filter", clause)
-
-
-def _collect_filter_results(scope, dag, scope_col_maps, block_index,
-                             result, seen):
-    """Trace filter columns to base tables and add to result."""
-    source_info = {}
-    for alias_name, source in scope.sources.items():
-        alias_upper = alias_name.upper()
-        if isinstance(source, exp.Table):
-            source_info[alias_upper] = (source.name.upper(), False, None)
-        elif isinstance(source, Scope):
-            source_info[alias_upper] = (alias_upper, True, source)
-
-    for col_node in scope.columns:
-        if isinstance(col_node.this, exp.Star):
-            continue
-        col_name = col_node.name.upper()
-        col_table_ref = col_node.table.upper() if col_node.table else ""
-
-        clause = _detect_clause(col_node)
-        if clause == "SELECT":
-            continue
-
-        resolved = _resolve_column(col_name, col_table_ref, source_info,
-                                    scope, scope_col_maps)
-        for src_tbl, src_col in resolved:
-            base_list = dag.trace_to_base(src_tbl, src_col)
-            for base_tbl, base_col in base_list:
-                pair = (base_tbl, base_col, clause)
-                if pair not in seen:
-                    seen.add(pair)
-                    result["columns"].append({
-                        "base_table": base_tbl,
-                        "column": base_col,
-                        "output_name": col_name,
-                        "source_path": f"{src_tbl}.{src_col}",
-                        "clause": clause,
-                        "is_base": True,
-                    })
 
 
 def _detect_clause(col_node) -> str:
@@ -801,7 +717,7 @@ def _detect_clause(col_node) -> str:
 
 
 # ===========================================================================
-# Phase 4: Output — JSON + DataFrame (edges table + resolved results)
+# Phase 4: Output — everything derived from the DAG edges
 # ===========================================================================
 
 def generate_report(block_results: list, dag: LineageDAG,
@@ -815,20 +731,20 @@ def generate_report(block_results: list, dag: LineageDAG,
             "total_base_tables": len(base_tables),
             "total_base_columns": len(leaf_columns),
             "base_tables": base_tables,
+            "base_columns": leaf_columns,
         },
         "lineage_edges": dag.edges,
-        "blocks": [],
+        "blocks": [
+            {
+                "block_index": br["block_index"],
+                "insert_target": br["insert_target"],
+                "ctes": br["ctes_found"],
+                "base_tables_referenced": br["base_tables_found"],
+                "parse_errors": br["parse_errors"],
+            }
+            for br in block_results
+        ],
     }
-
-    for br in block_results:
-        report["blocks"].append({
-            "block_index": br["block_index"],
-            "insert_target": br["insert_target"],
-            "ctes": br["ctes_found"],
-            "base_tables_referenced": br["base_tables_found"],
-            "columns": br["columns"],
-            "parse_errors": br["parse_errors"],
-        })
 
     with open(output_path, 'w') as f:
         json.dump(report, f, indent=2)
@@ -837,47 +753,72 @@ def generate_report(block_results: list, dag: LineageDAG,
     return report
 
 
-def build_dataframe(block_results: list, dag: LineageDAG):
+def build_dataframe(dag: LineageDAG):
     """
-    Build TWO DataFrames:
-      df_columns: resolved base table columns per block (for quick filtering)
-      df_edges:   the full DAG edge table (for lineage tracing / visualization)
+    Build TWO DataFrames, both derived from the DAG edges.
+
+    df_edges: the raw DAG — one row per edge.
+        Filtering:
+            df_edges[df_edges.scope_type == 'base']      # leaf/base edges
+            df_edges[df_edges.scope_type == 'root']       # final output edges
+            df_edges[df_edges.output_table == 'SEQ_ALERTS']  # what feeds a CTE
+
+    df_columns: flattened view — for each root output column, trace to base.
+        One row per (root_output_col, base_table, base_column).
+        Filtering:
+            df_columns                                   # all base columns
+            df_columns[df_columns.clause == 'SELECT']    # SELECT only
+            df_columns.groupby('base_table')['base_column'].apply(set)
 
     Returns (df_columns, df_edges)
-
-    df_columns filtering:
-        df[df.is_base]                              # base table columns
-        df[df.is_base & (df.clause == 'SELECT')]    # in SELECT only
-        df.groupby('base_table')['column'].apply(set)
-
-    df_edges tracing:
-        df[df.output_table == 'SEQ_ALERTS']         # what feeds seq_alerts
-        df[df.source_table == 'KDD_TRANSACTION']    # where KDD_TRANSACTION goes
     """
-    # df_columns: from block results
-    col_records = []
-    for br in block_results:
-        for c in br["columns"]:
-            col_records.append({"block_index": br["block_index"], **c})
-
-    # df_edges: from the DAG
+    # --- df_edges ---
     edge_records = dag.edges
+
+    # --- df_columns: derived by tracing root edges to leaves ---
+    col_records = []
+    root_edges = [e for e in dag.edges if e["scope_type"] in ("root", "filter")]
+
+    for e in root_edges:
+        out_col = e["output_column"]
+        src_tbl = e["source_table"]
+        src_col = e["source_column"]
+        clause = e["clause"]
+        block_idx = e["block_index"]
+
+        if src_tbl is None:
+            continue
+
+        # Trace to base table leaves
+        base_list = dag.trace_to_leaves(src_tbl, src_col)
+        for base_tbl, base_col in base_list:
+            col_records.append({
+                "block_index": block_idx,
+                "output_column": out_col,
+                "source_table": src_tbl,
+                "source_column": src_col,
+                "base_table": base_tbl,
+                "base_column": base_col,
+                "clause": clause,
+            })
 
     if not PANDAS_AVAILABLE:
         logger.warning("pandas not installed — returning lists of dicts")
         return col_records, edge_records
 
-    df_columns = pd.DataFrame(col_records)
-    df_edges = pd.DataFrame(edge_records)
-
-    if not df_columns.empty:
-        df_columns = df_columns.sort_values(
-            ["block_index", "base_table", "column", "clause"]
-        ).reset_index(drop=True)
+    df_edges = pd.DataFrame(edge_records) if edge_records else pd.DataFrame()
+    df_columns = pd.DataFrame(col_records) if col_records else pd.DataFrame()
 
     if not df_edges.empty:
         df_edges = df_edges.sort_values(
-            ["block_index", "scope_name", "output_table", "output_column"]
+            ["block_index", "scope_type", "output_table", "output_column"]
+        ).reset_index(drop=True)
+
+    if not df_columns.empty:
+        df_columns = df_columns.drop_duplicates(
+            subset=["block_index", "base_table", "base_column", "clause"]
+        ).sort_values(
+            ["block_index", "base_table", "base_column", "clause"]
         ).reset_index(drop=True)
 
     return df_columns, df_edges
@@ -891,8 +832,8 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
     """
     Full pipeline. Returns (report_dict, df_columns, df_edges).
 
-    df_columns: one row per (base_table, column, clause) — the resolved results.
-    df_edges: the full lineage DAG — every edge from output → source.
+    df_columns: flattened base table columns, derived from the DAG.
+    df_edges: the full lineage DAG edge table.
     """
     logger.info(f"Reading {input_path}")
     text = Path(input_path).read_text(encoding='utf-8', errors='replace')
@@ -922,23 +863,21 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
             logger.info(
                 f"  Block {i + 1}: "
                 f"{len(res['base_tables_found'])} base tables, "
-                f"{len(res['ctes_found'])} CTEs, "
-                f"{len(res['columns'])} resolved columns"
+                f"{len(res['ctes_found'])} CTEs"
                 + (f", INSERT INTO {res['insert_target']}"
                    if res['insert_target'] else "")
             )
 
     report = generate_report(block_results, dag, output_path)
-    df_columns, df_edges = build_dataframe(block_results, dag)
+    df_columns, df_edges = build_dataframe(dag)
 
     print(f"\n{'=' * 60}")
     print(f"  Analysis Complete")
     print(f"{'=' * 60}")
     print(f"  Blocks analyzed:    {len(block_results)}")
     print(f"  Base tables:        {dag.get_base_tables()}")
+    print(f"  Base columns:       {len(dag.get_leaf_columns())}")
     print(f"  Lineage edges:      {len(dag.edges)}")
-    total_cols = sum(len(br['columns']) for br in block_results)
-    print(f"  Resolved columns:   {total_cols}")
     print(f"  JSON report:        {output_path}")
     print(f"{'=' * 60}\n")
 
