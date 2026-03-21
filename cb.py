@@ -1019,7 +1019,8 @@ def build_dataframe(dag):
 # Main
 # ===========================================================================
 
-def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
+def analyze_file(input_path: str, output_path: str = "analysis_results.json",
+                 raise_on_error: bool = False):
     logger.info(f"Reading {input_path}")
     text = Path(input_path).read_text(encoding='utf-8', errors='replace')
 
@@ -1063,6 +1064,17 @@ def analyze_file(input_path: str, output_path: str = "analysis_results.json"):
                 f"{len(res['ctes_found'])} CTEs"
                 + (f", INSERT INTO {res['insert_target']}" if res['insert_target'] else ""))
 
+    # Raise if any block had errors
+    if raise_on_error:
+        all_errors = []
+        for br in block_results:
+            for err in br["parse_errors"]:
+                all_errors.append(f"Block {br['block_index']}: {err}")
+        if all_errors:
+            raise RuntimeError(
+                f"Parse errors in {input_path}:\n" + "\n".join(all_errors)
+            )
+
     report = generate_report(block_results, dag, output_path)
     df_edges = build_dataframe(dag)
 
@@ -1089,3 +1101,4 @@ if __name__ == "__main__":
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     analyze_file(args.input, args.output)
+    #report, df = analyze_file("script.sql", raise_on_error=True)
