@@ -716,9 +716,10 @@ def _collect_from_sources(node, local_scope, dag, known_tables,
 
     if isinstance(node, exp.Subquery):
         alias = node.alias.upper() if node.alias else "__SUBQ"
-        # FROM subqueries get parent_scope, NOT local_scope
+        # FROM subqueries can't reference outer tables (no correlation)
+        # so they get empty parent_scope
         sub_col_map, _ = _process_node(
-            node.this, dag, known_tables, parent_scope, block_index, alias)
+            node.this, dag, known_tables, {}, block_index, alias)
         for out_col, sources in sub_col_map.items():
             for item in sources:
                 src_tbl, src_col = item[0], item[1]
@@ -796,21 +797,26 @@ def _resolve_column(col_name, col_table_ref, own_scope, local_scope, dag,
         dag.add_leaf(col_table_ref, col_name, block_index, scope_name, clause)
         return [(col_table_ref, col_name, False, False)]
 
-    # Unqualified column — own_scope ONLY, always unqualified=True
+    # Unqualified column — own_scope ONLY
+    # If single table and no parent scope, it's mathematically certain
+    has_parent = len(local_scope) > len(own_scope)
+
     if len(own_scope) == 0:
         return [("UNRESOLVED", col_name, False, True)]
 
     if len(own_scope) == 1:
         alias, table_name = next(iter(own_scope.items()))
+        # Single table + no parent → 100% certain, not flagged unqualified
+        is_unq = has_parent
         if table_name in known_tables:
             col_map = known_tables[table_name]
             if col_name in col_map:
-                return [_ensure_4tuple(item, True) for item in col_map[col_name]]
-            return [(table_name, col_name, False, True)]
+                return [_ensure_4tuple(item, is_unq) for item in col_map[col_name]]
+            return [(table_name, col_name, False, is_unq)]
         else:
             dag.add_leaf(table_name, col_name, block_index, scope_name, clause,
-                         unqualified=True)
-            return [(table_name, col_name, False, True)]
+                         unqualified=is_unq)
+            return [(table_name, col_name, False, is_unq)]
 
     # Multiple tables — disambiguate
     derived_matches = []
