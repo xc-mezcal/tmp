@@ -411,7 +411,7 @@ class LineageDAG:
 
     def add_edge(self, out_tbl, out_col, src_tbl, src_col,
                  block_index, scope_name, scope_type, clause="SELECT",
-                 ambiguous=False):
+                 ambiguous=False, unqualified=False):
         ot = out_tbl.upper() if out_tbl else None
         oc = out_col.upper() if out_col else None
         st = src_tbl.upper() if src_tbl else None
@@ -425,12 +425,14 @@ class LineageDAG:
             "source_table": st, "source_column": sc,
             "block_index": block_index, "scope_name": scope_name,
             "scope_type": scope_type, "clause": clause,
-            "ambiguous": ambiguous,
+            "ambiguous": ambiguous, "unqualified": unqualified,
         })
 
-    def add_leaf(self, table, column, block_index, scope_name, clause="SELECT"):
+    def add_leaf(self, table, column, block_index, scope_name, clause="SELECT",
+                 unqualified=False):
         self.add_edge(table, column, None, None,
-                      block_index, scope_name, "base", clause)
+                      block_index, scope_name, "base", clause,
+                      unqualified=unqualified)
 
     def register_scope(self, name, col_map):
         self._scope_columns[name.upper()] = col_map
@@ -491,9 +493,12 @@ def process_block(cleaned_sql: str, dag: LineageDAG, block_index: int) -> dict:
     if scope_name == "__ROOT" and col_map:
         root_name = f"__ROOT_BLOCK_{block_index}"
         for out_col, sources in col_map.items():
-            for src_tbl, src_col, amb in sources:
+            for item in sources:
+                src_tbl, src_col = item[0], item[1]
+                amb = item[2] if len(item) > 2 else False
+                unq = item[3] if len(item) > 3 else False
                 dag.add_edge(root_name, out_col, src_tbl, src_col,
-                             block_index, root_name, "root", ambiguous=amb)
+                             block_index, root_name, "root", ambiguous=amb, unqualified=False)
 
     if scope_name and scope_name != "__ROOT":
         result["insert_target"] = scope_name
@@ -563,9 +568,12 @@ def _process_insert(node, dag, known_tables, parent_scope, block_index):
 
     if target_table and col_map:
         for out_col, sources in col_map.items():
-            for src_tbl, src_col, amb in sources:
+            for item in sources:
+                src_tbl, src_col = item[0], item[1]
+                amb = item[2] if len(item) > 2 else False
+                unq = item[3] if len(item) > 3 else False
                 dag.add_edge(target_table, out_col, src_tbl, src_col,
-                             block_index, target_table, "root", ambiguous=amb)
+                             block_index, target_table, "root", ambiguous=amb, unqualified=False)
         known_tables[target_table] = col_map
         dag.register_scope(target_table, col_map)
 
@@ -619,65 +627,72 @@ def _process_select(node, dag, known_tables, parent_scope, block_index, scope_na
                 cte_body, dag, known_tables, {}, block_index, cte_name)
 
             for out_col, sources in cte_col_map.items():
-                for src_tbl, src_col, amb in sources:
+                for item in sources:
+                    src_tbl, src_col = item[0], item[1]
+                    amb = item[2] if len(item) > 2 else False
+                    unq = item[3] if len(item) > 3 else False
                     dag.add_edge(cte_name, out_col, src_tbl, src_col,
-                                 block_index, cte_name, "cte", ambiguous=amb)
+                                 block_index, cte_name, "cte", ambiguous=amb, unqualified=False)
 
             known_tables[cte_name] = cte_col_map
             dag.register_scope(cte_name, cte_col_map)
 
-    # --- Step 2: Build local_scope = parent_scope + FROM tables ---
-    local_scope = dict(parent_scope)
+    # --- Step 2: Build own_scope (this SELECT's tables) and local_scope (own + parent) ---
+    own_scope = {}  # only this SELECT's FROM/JOIN tables
 
     from_clause = node.args.get("from") or node.args.get("from_")
     if from_clause:
-        # FROM subqueries get parent_scope (NOT local_scope — can't see siblings)
-        _collect_from_sources(from_clause, local_scope, dag, known_tables,
+        _collect_from_sources(from_clause, own_scope, dag, known_tables,
                               parent_scope, block_index, scope_name)
 
-    # --- Step 3: JOINs → add to local_scope ---
+    # --- Step 3: JOINs → add to own_scope ---
     joins = node.args.get("joins") or []
     for join_node in joins:
-        _collect_from_sources(join_node, local_scope, dag, known_tables,
+        _collect_from_sources(join_node, own_scope, dag, known_tables,
                               parent_scope, block_index, scope_name)
 
-    logger.debug(f"  [{scope_name}] local_scope: {list(local_scope.keys())}")
+    # local_scope = own + parent (for qualified correlated refs)
+    local_scope = dict(parent_scope)
+    local_scope.update(own_scope)
+
+    logger.debug(f"  [{scope_name}] own_scope: {list(own_scope.keys())}, "
+                 f"inherited: {[k for k in parent_scope if k not in own_scope]}")
 
     # --- Step 3b: JOIN ON conditions ---
     for join_node in joins:
         on_clause = join_node.args.get("on")
         if on_clause:
-            _gather_columns(on_clause, dag, known_tables, local_scope,
+            _gather_columns(on_clause, dag, known_tables, own_scope, local_scope,
                             block_index, scope_name, "JOIN_ON")
 
     # --- Step 4: WHERE ---
     where_clause = node.args.get("where")
     if where_clause:
-        _gather_columns(where_clause, dag, known_tables, local_scope,
+        _gather_columns(where_clause, dag, known_tables, own_scope, local_scope,
                         block_index, scope_name, "WHERE")
 
     # --- Step 5: GROUP BY ---
     group_clause = node.args.get("group")
     if group_clause:
-        _gather_columns(group_clause, dag, known_tables, local_scope,
+        _gather_columns(group_clause, dag, known_tables, own_scope, local_scope,
                         block_index, scope_name, "GROUP_BY")
 
     # --- Step 6: HAVING ---
     having_clause = node.args.get("having")
     if having_clause:
-        _gather_columns(having_clause, dag, known_tables, local_scope,
+        _gather_columns(having_clause, dag, known_tables, own_scope, local_scope,
                         block_index, scope_name, "HAVING")
 
     # --- Step 7: ORDER BY ---
     order_clause = node.args.get("order")
     if order_clause:
-        _gather_columns(order_clause, dag, known_tables, local_scope,
+        _gather_columns(order_clause, dag, known_tables, own_scope, local_scope,
                         block_index, scope_name, "ORDER_BY")
 
     # --- Step 8: SELECT expressions ---
     col_map = {}
     for sel_expr in node.expressions:
-        _process_select_expr(sel_expr, dag, known_tables, local_scope,
+        _process_select_expr(sel_expr, dag, known_tables, own_scope, local_scope,
                              col_map, block_index, scope_name)
 
     return col_map, scope_name
@@ -705,9 +720,12 @@ def _collect_from_sources(node, local_scope, dag, known_tables,
         sub_col_map, _ = _process_node(
             node.this, dag, known_tables, parent_scope, block_index, alias)
         for out_col, sources in sub_col_map.items():
-            for src_tbl, src_col, amb in sources:
+            for item in sources:
+                src_tbl, src_col = item[0], item[1]
+                amb = item[2] if len(item) > 2 else False
+                unq = item[3] if len(item) > 3 else False
                 dag.add_edge(alias, out_col, src_tbl, src_col,
-                             block_index, alias, "subquery", ambiguous=amb)
+                             block_index, alias, "subquery", ambiguous=amb, unqualified=False)
         known_tables[alias] = sub_col_map
         local_scope[alias] = alias
         return
@@ -741,13 +759,16 @@ def _collect_from_sources(node, local_scope, dag, known_tables,
 # Column resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_column(col_name, col_table_ref, local_scope, dag,
+def _resolve_column(col_name, col_table_ref, own_scope, local_scope, dag,
                      known_tables, block_index, scope_name, clause):
     """
-    Resolve one column. Returns [(src_tbl, src_col, ambiguous), ...].
-    local_scope: {ALIAS: TABLE_NAME}
-    If TABLE_NAME in known_tables → derived, trace through col_map.
-    If not → base, add leaf edge.
+    Resolve one column. Returns [(src_tbl, src_col, ambiguous, unqualified), ...].
+
+    own_scope: {ALIAS: TABLE_NAME} — this SELECT's FROM/JOIN only
+    local_scope: {ALIAS: TABLE_NAME} — own + parent (for qualified correlated refs)
+
+    Qualified (t.col): look up alias in local_scope → ambiguous=False, unqualified=False
+    Unqualified (col): look up in own_scope only → unqualified=True always
     """
     col_name = col_name.upper()
 
@@ -759,66 +780,80 @@ def _resolve_column(col_name, col_table_ref, local_scope, dag,
             if table_name in known_tables:
                 col_map = known_tables[table_name]
                 if col_name in col_map:
-                    return col_map[col_name]
-                return [(table_name, col_name, False)]
+                    # Propagate from col_map — ensure 4-tuple
+                    return [_ensure_4tuple(item, False) for item in col_map[col_name]]
+                return [(table_name, col_name, False, False)]
             else:
                 dag.add_leaf(table_name, col_name, block_index, scope_name, clause)
-                return [(table_name, col_name, False)]
+                return [(table_name, col_name, False, False)]
 
-        # Not in local_scope — check known_tables directly (CTE referenced by name)
         if col_table_ref in known_tables:
             col_map = known_tables[col_table_ref]
             if col_name in col_map:
-                return col_map[col_name]
-            return [(col_table_ref, col_name, False)]
+                return [_ensure_4tuple(item, False) for item in col_map[col_name]]
+            return [(col_table_ref, col_name, False, False)]
 
-        # Unknown table — base
         dag.add_leaf(col_table_ref, col_name, block_index, scope_name, clause)
-        return [(col_table_ref, col_name, False)]
+        return [(col_table_ref, col_name, False, False)]
 
-    # Unqualified column
-    if len(local_scope) == 1:
-        alias, table_name = next(iter(local_scope.items()))
+    # Unqualified column — own_scope ONLY, always unqualified=True
+    if len(own_scope) == 0:
+        return [("UNRESOLVED", col_name, False, True)]
+
+    if len(own_scope) == 1:
+        alias, table_name = next(iter(own_scope.items()))
         if table_name in known_tables:
             col_map = known_tables[table_name]
             if col_name in col_map:
-                return col_map[col_name]
-            return [(table_name, col_name, False)]
+                return [_ensure_4tuple(item, True) for item in col_map[col_name]]
+            return [(table_name, col_name, False, True)]
         else:
-            dag.add_leaf(table_name, col_name, block_index, scope_name, clause)
-            return [(table_name, col_name, False)]
+            dag.add_leaf(table_name, col_name, block_index, scope_name, clause,
+                         unqualified=True)
+            return [(table_name, col_name, False, True)]
 
-    # Multiple sources — disambiguate
+    # Multiple tables — disambiguate
     derived_matches = []
     base_matches = []
-    for alias, table_name in local_scope.items():
+    for alias, table_name in own_scope.items():
         if table_name in known_tables:
             col_map = known_tables[table_name]
             if col_name in col_map:
-                derived_matches.append((table_name, col_name, False))
+                derived_matches.append((table_name, col_name))
         else:
-            base_matches.append((table_name, col_name, False))
+            base_matches.append((table_name, col_name))
 
-    if len(derived_matches) == 1:
-        return derived_matches
-    if derived_matches:
-        return [(t, c, True) for t, c, _ in derived_matches]
-    if len(base_matches) == 1:
-        dag.add_leaf(base_matches[0][0], col_name, block_index, scope_name, clause)
-        return base_matches
-    if base_matches:
-        for t, _, _ in base_matches:
-            dag.add_leaf(t, col_name, block_index, scope_name, clause)
-        return [(t, c, True) for t, c, _ in base_matches]
+    if len(derived_matches) == 1 and not base_matches:
+        return [(derived_matches[0][0], derived_matches[0][1], False, True)]
+    if derived_matches and not base_matches:
+        return [(t, c, True, True) for t, c in derived_matches]
+    if len(base_matches) == 1 and not derived_matches:
+        dag.add_leaf(base_matches[0][0], col_name, block_index, scope_name, clause,
+                     unqualified=True)
+        return [(base_matches[0][0], base_matches[0][1], False, True)]
 
-    return [("UNRESOLVED", col_name, False)]
+    all_matches = derived_matches + base_matches
+    for t, c in base_matches:
+        dag.add_leaf(t, col_name, block_index, scope_name, clause,
+                     unqualified=True)
+    return [(t, c, True, True) for t, c in all_matches]
+
+
+def _ensure_4tuple(item, unqualified_override):
+    """Ensure item is a 4-tuple (src_tbl, src_col, ambiguous, unqualified)."""
+    if len(item) == 4:
+        return (item[0], item[1], item[2], unqualified_override or item[3])
+    elif len(item) == 3:
+        return (item[0], item[1], item[2], unqualified_override)
+    else:
+        return (item[0], item[1], False, unqualified_override)
 
 
 # ---------------------------------------------------------------------------
 # Gather columns from WHERE, GROUP BY, HAVING, ORDER BY, JOIN ON
 # ---------------------------------------------------------------------------
 
-def _gather_columns(node, dag, known_tables, local_scope,
+def _gather_columns(node, dag, known_tables, own_scope, local_scope,
                      block_index, scope_name, clause):
     """
     Recursive walk. Handles arbitrary nesting: And→Not→Exists→Select etc.
@@ -831,13 +866,16 @@ def _gather_columns(node, dag, known_tables, local_scope,
                 continue
             col_name = child.name.upper()
             col_table_ref = child.table.upper() if child.table else ""
-            sources = _resolve_column(col_name, col_table_ref, local_scope,
-                                       dag, known_tables, block_index,
-                                       scope_name, clause)
-            for src_tbl, src_col, amb in sources:
+            sources = _resolve_column(col_name, col_table_ref, own_scope,
+                                       local_scope, dag, known_tables,
+                                       block_index, scope_name, clause)
+            for item in sources:
+                src_tbl, src_col = item[0], item[1]
+                amb = item[2] if len(item) > 2 else False
+                unq = item[3] if len(item) > 3 else False
                 dag.add_edge(scope_name, col_name, src_tbl, src_col,
                              block_index, scope_name, "filter", clause,
-                             ambiguous=amb)
+                             ambiguous=amb, unqualified=unq)
 
         elif isinstance(child, (exp.Subquery, exp.Select)):
             # New scope — gets local_scope as parent_scope for correlated refs
@@ -848,7 +886,7 @@ def _gather_columns(node, dag, known_tables, local_scope,
                           block_index, alias)
 
         else:
-            _gather_columns(child, dag, known_tables, local_scope,
+            _gather_columns(child, dag, known_tables, own_scope, local_scope,
                             block_index, scope_name, clause)
 
 
@@ -856,7 +894,7 @@ def _gather_columns(node, dag, known_tables, local_scope,
 # SELECT expression processing
 # ---------------------------------------------------------------------------
 
-def _process_select_expr(sel_expr, dag, known_tables, local_scope,
+def _process_select_expr(sel_expr, dag, known_tables, own_scope, local_scope,
                           col_map, block_index, scope_name):
     # --- Star ---
     if isinstance(sel_expr, exp.Star):
@@ -886,35 +924,32 @@ def _process_select_expr(sel_expr, dag, known_tables, local_scope,
     if isinstance(sel_expr, exp.Column):
         col_name = sel_expr.name.upper()
         col_ref = sel_expr.table.upper() if sel_expr.table else ""
-        sources = _resolve_column(col_name, col_ref, local_scope, dag,
-                                   known_tables, block_index, scope_name, "SELECT")
+        sources = _resolve_column(col_name, col_ref, own_scope, local_scope,
+                                   dag, known_tables, block_index, scope_name, "SELECT")
 
     elif isinstance(sel_expr, exp.Alias):
         inner = sel_expr.this
         if isinstance(inner, exp.Column):
             col_name = inner.name.upper()
             col_ref = inner.table.upper() if inner.table else ""
-            sources = _resolve_column(col_name, col_ref, local_scope, dag,
-                                       known_tables, block_index, scope_name, "SELECT")
+            sources = _resolve_column(col_name, col_ref, own_scope, local_scope,
+                                       dag, known_tables, block_index, scope_name, "SELECT")
         elif isinstance(inner, (exp.Subquery, exp.Select)):
-            # Scalar subquery as alias: (SELECT ...) AS name
             sub_map, _ = _process_node(inner, dag, known_tables, local_scope,
                                         block_index, "__SCALAR")
             for sub_col, sub_sources in sub_map.items():
                 sources.extend(sub_sources)
         else:
-            # Complex expression inside alias
-            _collect_shallow_columns(inner, local_scope, dag, known_tables,
-                                      sources, block_index, scope_name)
+            _collect_shallow_columns(inner, own_scope, local_scope, dag,
+                                      known_tables, sources, block_index, scope_name)
             for subq in inner.find_all(exp.Subquery):
                 sub_map, _ = _process_node(subq, dag, known_tables, local_scope,
                                             block_index, "__SCALAR")
                 for sub_col, sub_sources in sub_map.items():
                     sources.extend(sub_sources)
     else:
-        # Complex expression (not alias, not column)
-        _collect_shallow_columns(sel_expr, local_scope, dag, known_tables,
-                                  sources, block_index, scope_name)
+        _collect_shallow_columns(sel_expr, own_scope, local_scope, dag,
+                                  known_tables, sources, block_index, scope_name)
         for subq in sel_expr.find_all(exp.Subquery):
             sub_map, _ = _process_node(subq, dag, known_tables, local_scope,
                                         block_index, "__SCALAR")
@@ -957,7 +992,7 @@ def _find_column_shallow(node):
     return None
 
 
-def _collect_shallow_columns(node, local_scope, dag, known_tables,
+def _collect_shallow_columns(node, own_scope, local_scope, dag, known_tables,
                               sources, block_index, scope_name):
     for child in node.iter_expressions():
         if isinstance(child, exp.Column):
@@ -965,15 +1000,16 @@ def _collect_shallow_columns(node, local_scope, dag, known_tables,
                 continue
             col_name = child.name.upper()
             col_ref = child.table.upper() if child.table else ""
-            resolved = _resolve_column(col_name, col_ref, local_scope, dag,
-                                        known_tables, block_index,
+            resolved = _resolve_column(col_name, col_ref, own_scope, local_scope,
+                                        dag, known_tables, block_index,
                                         scope_name, "SELECT")
             sources.extend(resolved)
         elif isinstance(child, (exp.Subquery, exp.Select)):
             continue
         else:
-            _collect_shallow_columns(child, local_scope, dag, known_tables,
-                                      sources, block_index, scope_name)
+            _collect_shallow_columns(child, own_scope, local_scope, dag,
+                                      known_tables, sources, block_index,
+                                      scope_name)
 
 
 # ===========================================================================
@@ -1101,4 +1137,3 @@ if __name__ == "__main__":
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     analyze_file(args.input, args.output)
-    #report, df = analyze_file("script.sql", raise_on_error=True)
