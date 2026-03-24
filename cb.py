@@ -872,16 +872,17 @@ def _gather_columns(node, dag, known_tables, own_scope, local_scope,
                 continue
             col_name = child.name.upper()
             col_table_ref = child.table.upper() if child.table else ""
+            # Determine unqualified from THIS reference, not from inner sources
+            is_unqualified = not col_table_ref
             sources = _resolve_column(col_name, col_table_ref, own_scope,
                                        local_scope, dag, known_tables,
                                        block_index, scope_name, clause)
             for item in sources:
                 src_tbl, src_col = item[0], item[1]
                 amb = item[2] if len(item) > 2 else False
-                unq = item[3] if len(item) > 3 else False
                 dag.add_edge(scope_name, col_name, src_tbl, src_col,
                              block_index, scope_name, "filter", clause,
-                             ambiguous=amb, unqualified=unq)
+                             ambiguous=amb, unqualified=is_unqualified)
 
         elif isinstance(child, (exp.Subquery, exp.Select)):
             # New scope — gets local_scope as parent_scope for correlated refs
