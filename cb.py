@@ -980,10 +980,10 @@ def _expand_star(table_ref, local_scope, col_map, dag, known_tables,
             scope_col_map = known_tables[table_name]
             for col in scope_col_map:
                 if col:
-                    col_map[col] = [(table_name, col, False)]
+                    col_map[col] = [(table_name, col, False, False)]
         else:
             dag.add_leaf(table_name, "*", block_index, scope_name, "SELECT")
-            col_map["*"] = [(table_name, "*", False)]
+            col_map["*"] = [(table_name, "*", False, False)]
 
 
 def _find_column_shallow(node):
