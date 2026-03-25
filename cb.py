@@ -818,31 +818,13 @@ def _resolve_column(col_name, col_table_ref, own_scope, local_scope, dag,
                          unqualified=is_unq)
             return [(table_name, col_name, False, is_unq)]
 
-    # Multiple tables — disambiguate
-    derived_matches = []
-    base_matches = []
-    for alias, table_name in own_scope.items():
-        if table_name in known_tables:
-            col_map = known_tables[table_name]
-            if col_name in col_map:
-                derived_matches.append((table_name, col_name))
-        else:
-            base_matches.append((table_name, col_name))
-
-    if len(derived_matches) == 1 and not base_matches:
-        return [(derived_matches[0][0], derived_matches[0][1], False, True)]
-    if derived_matches and not base_matches:
-        return [(t, c, True, True) for t, c in derived_matches]
-    if len(base_matches) == 1 and not derived_matches:
-        dag.add_leaf(base_matches[0][0], col_name, block_index, scope_name, clause,
-                     unqualified=True)
-        return [(base_matches[0][0], base_matches[0][1], False, True)]
-
-    all_matches = derived_matches + base_matches
-    for t, c in base_matches:
-        dag.add_leaf(t, col_name, block_index, scope_name, clause,
-                     unqualified=True)
-    return [(t, c, True, True) for t, c in all_matches]
+    # Multiple tables in own_scope — Rule 4: ambiguous + unqualified, propagate to all
+    all_tables = list(own_scope.values())
+    for table_name in all_tables:
+        if table_name not in known_tables:
+            dag.add_leaf(table_name, col_name, block_index, scope_name, clause,
+                         unqualified=True)
+    return [(t, col_name, True, True) for t in all_tables]
 
 
 def _ensure_4tuple(item, unqualified_override):
@@ -872,11 +854,19 @@ def _gather_columns(node, dag, known_tables, own_scope, local_scope,
                 continue
             col_name = child.name.upper()
             col_table_ref = child.table.upper() if child.table else ""
-            # Determine unqualified from THIS reference, not from inner sources
-            is_unqualified = not col_table_ref
             sources = _resolve_column(col_name, col_table_ref, own_scope,
                                        local_scope, dag, known_tables,
                                        block_index, scope_name, clause)
+            # Determine unqualified from THIS reference point
+            if col_table_ref:
+                is_unqualified = False
+            else:
+                # Unqualified: apply same has_parent refinement as _resolve_column
+                has_parent = len(local_scope) > len(own_scope)
+                if len(own_scope) == 1 and not has_parent:
+                    is_unqualified = False  # single table, no parent → certain
+                else:
+                    is_unqualified = True
             for item in sources:
                 src_tbl, src_col = item[0], item[1]
                 amb = item[2] if len(item) > 2 else False
