@@ -355,17 +355,23 @@ def _extract_until_semicolon(text: str, pos: int) -> Optional[str]:
 def _parse_declare_variables(plsql_text: str) -> set:
     variables = set()
     text_upper = plsql_text.upper()
-    decl_start = text_upper.find('DECLARE')
-    begin_pos = text_upper.find('BEGIN', decl_start if decl_start >= 0 else 0)
-    if decl_start < 0 or begin_pos < 0:
-        return variables
-    decl_section = plsql_text[decl_start + 7:begin_pos]
     var_pattern = re.compile(
         r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s+(?:NUMBER|VARCHAR2|DATE|CHAR|INTEGER|BOOLEAN|TIMESTAMP)',
         re.IGNORECASE | re.MULTILINE
     )
-    for m in var_pattern.finditer(decl_section):
-        variables.add(m.group(1).upper())
+    # Find all DECLARE...BEGIN pairs
+    search_start = 0
+    while True:
+        decl_start = text_upper.find('DECLARE', search_start)
+        if decl_start < 0:
+            break
+        begin_pos = text_upper.find('BEGIN', decl_start + 7)
+        if begin_pos < 0:
+            break
+        decl_section = plsql_text[decl_start + 7:begin_pos]
+        for m in var_pattern.finditer(decl_section):
+            variables.add(m.group(1).upper())
+        search_start = begin_pos + 5
     return variables
 
 
