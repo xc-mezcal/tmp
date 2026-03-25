@@ -498,7 +498,7 @@ def process_block(cleaned_sql: str, dag: LineageDAG, block_index: int) -> dict:
                 amb = item[2] if len(item) > 2 else False
                 unq = item[3] if len(item) > 3 else False
                 dag.add_edge(root_name, out_col, src_tbl, src_col,
-                             block_index, root_name, "root", ambiguous=amb, unqualified=False)
+                             block_index, root_name, "root", ambiguous=False, unqualified=False)
 
     if scope_name and scope_name != "__ROOT":
         result["insert_target"] = scope_name
@@ -573,7 +573,7 @@ def _process_insert(node, dag, known_tables, parent_scope, block_index):
                 amb = item[2] if len(item) > 2 else False
                 unq = item[3] if len(item) > 3 else False
                 dag.add_edge(target_table, out_col, src_tbl, src_col,
-                             block_index, target_table, "root", ambiguous=amb, unqualified=False)
+                             block_index, target_table, "root", ambiguous=False, unqualified=False)
         known_tables[target_table] = col_map
         dag.register_scope(target_table, col_map)
 
@@ -632,7 +632,7 @@ def _process_select(node, dag, known_tables, parent_scope, block_index, scope_na
                     amb = item[2] if len(item) > 2 else False
                     unq = item[3] if len(item) > 3 else False
                     dag.add_edge(cte_name, out_col, src_tbl, src_col,
-                                 block_index, cte_name, "cte", ambiguous=amb, unqualified=False)
+                                 block_index, cte_name, "cte", ambiguous=False, unqualified=False)
 
             known_tables[cte_name] = cte_col_map
             dag.register_scope(cte_name, cte_col_map)
@@ -726,7 +726,7 @@ def _collect_from_sources(node, local_scope, dag, known_tables,
                 amb = item[2] if len(item) > 2 else False
                 unq = item[3] if len(item) > 3 else False
                 dag.add_edge(alias, out_col, src_tbl, src_col,
-                             block_index, alias, "subquery", ambiguous=amb, unqualified=False)
+                             block_index, alias, "subquery", ambiguous=False, unqualified=False)
         known_tables[alias] = sub_col_map
         local_scope[alias] = alias
         return
